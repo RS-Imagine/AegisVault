@@ -1,0 +1,97 @@
+name: Build Windows Portable EXE & Android Base APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ============================================================================
+  # Job 1: Windows True Portable Edition (Single .exe + ./aegis-data USB-ready)
+  # ============================================================================
+  build-windows-portable:
+    name: Windows 绿色便携版 (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies & run V2 security test suite
+        run: |
+          npm install --legacy-peer-deps
+          npm test
+          npm run build
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Generate Windows icon & compile standalone Portable EXE
+        shell: pwsh
+        run: |
+          npx --yes @tauri-apps/cli@^2.0.0 icon public/pwa-512x512.png
+          npx --yes @tauri-apps/cli@^2.0.0 build --no-bundle
+          New-Item -ItemType Directory -Force -Path dist-portable/aegis-data | Out-Null
+          Copy-Item "src-tauri/target/release/aegis-vault-portable.exe" "dist-portable/AegisVault-Portable.exe"
+          Set-Content -Path "dist-portable/README-便携版说明.txt" -Value "AegisVault V2 绿色便携版`r`n1. 直接双击 AegisVault-Portable.exe 即可运行（免安装）。`r`n2. 所有加密密码库数据均保存在同级目录的 aegis-data 文件夹中，可随 U 盘或移动硬盘任意迁移，不在系统 C 盘残留数据。" -Encoding UTF8
+
+      - name: Upload Windows True Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AegisVault-Windows-Portable-x64
+          path: dist-portable/
+
+  # ============================================================================
+  # Job 2: Foundational Android App (.apk with Autofill Bridge ready)
+  # ============================================================================
+  build-android-apk:
+    name: Android 基础版安装包 (.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21 for Android Gradle build
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Web bundle & generate Capacitor Android project
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+          npm install --legacy-peer-deps @capacitor/core@^7.0.0 @capacitor/cli@^7.0.0 @capacitor/android@^7.0.0
+          npx cap add android
+          npx cap sync android
+
+      - name: Assemble Android APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../AegisVault-Android-v2.0.0.apk
+
+      - name: Upload Android Base APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AegisVault-Android-Base-APK
+          path: AegisVault-Android-v2.0.0.apk

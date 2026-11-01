@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>AegisVault — 零知识个人密码库</title>
+    <meta name="description" content="AegisVault 是采用 Web Crypto API (PBKDF2 + AES-256-GCM) 的零知识个人加密密码管理器，支持 PWA 离线冷启动与 Cloudflare Workers 自托管端到端加密同步。" />
+    <meta property="og:title" content="AegisVault — 零知识个人密码库" />
+    <meta property="og:description" content="AegisVault 是采用 Web Crypto API (PBKDF2 + AES-256-GCM) 的零知识个人加密密码管理器，支持 PWA 离线冷启动与 Cloudflare Workers 自托管端到端加密同步。" />
+    <meta name="theme-color" content="#090d16" id="aegis-theme-color" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="AegisVault" />
+    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <script>
+      (function () {
+        try {
+          var saved = window.localStorage.getItem('aegis_theme_mode');
+          var sysDark =
+            window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var isDark =
+            saved === 'dark' ? true : saved === 'light' ? false : sysDark;
+          var root = document.documentElement;
+          if (isDark) {
+            root.classList.add('dark');
+          } else {
+            root.classList.remove('dark');
+          }
+          var meta = document.getElementById('aegis-theme-color');
+          if (meta) {
+            meta.setAttribute('content', isDark ? '#090d16' : '#f8fafc');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 dark:bg-[#090d16] dark:text-slate-100 antialiased selection:bg-blue-500/30 selection:text-blue-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

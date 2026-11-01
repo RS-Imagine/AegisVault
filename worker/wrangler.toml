@@ -1,0 +1,21 @@
+name = "aegis-vault-sync"
+main = "src/index.ts"
+compatibility_date = "2025-02-01"
+
+# Durable Objects binding for strong consistency and atomic revision checks.
+# Compatible with Cloudflare Workers Free plan via SQLite-backed Durable Objects.
+[[durable_objects.bindings]]
+name = "VAULT_DO"
+class_name = "VaultDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultDurableObject"]
+
+# Optional: Comma-separated list of allowed frontend origins for CORS
+# [vars]
+# ALLOWED_ORIGINS = "https://your-domain.example.com,http://localhost:3000"
+
+# IMPORTANT: Never put API_TOKEN in this file!
+# Configure API_TOKEN via Cloudflare Secrets:
+#   npx wrangler secret put API_TOKEN

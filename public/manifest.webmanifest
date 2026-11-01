@@ -1,0 +1,40 @@
+{
+  "id": "./",
+  "name": "AegisVault — 零知识个人密码库",
+  "short_name": "AegisVault",
+  "description": "采用 Web Crypto API (PBKDF2 + AES-256-GCM) 的零知识个人加密密码管理器，支持离线冷启动与 Cloudflare Workers 自托管端到端同步。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#090d16",
+  "theme_color": "#090d16",
+  "lang": "zh-CN",
+  "categories": ["security", "utilities", "productivity"],
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
