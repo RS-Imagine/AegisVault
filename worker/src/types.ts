@@ -1,12 +1,12 @@
 /**
  * AegisVault V2 Sync Protocol & Durable Object Storage Types
  *
- * Strictly V2 only (`formatVersion: 2`, `protocolVersion: 2`).
+ * Sync protocol 2 supports encrypted envelope formats 2 and 3.
  * Legacy V1 payloads and KV storage are permanently removed.
  */
 
 export const SYNC_PROTOCOL_VERSION = 2 as const;
-export const VAULT_FORMAT_VERSION = 2 as const;
+export const VAULT_FORMAT_VERSION = 3 as const;
 export const MAX_VAULT_BODY_BYTES = 1024 * 1024; // 1 MiB
 export const MAX_HISTORY_SNAPSHOTS = 15;
 export const SINGLETON_DO_INSTANCE_NAME = 'aegis-primary-vault-singleton';
@@ -26,7 +26,9 @@ export interface V2EncryptedRecordEnvelope {
 }
 
 export interface V2EncryptedVaultPayload {
-  formatVersion: typeof VAULT_FORMAT_VERSION;
+  formatVersion: 2 | 3;
+  snapshotSequence?: number;
+  integrity?: EncryptedBlob;
   vaultId: string; // Independent 128-bit / UUID identifier
   createdAt: string; // ISO-8601
   updatedAt: string; // ISO-8601
@@ -93,6 +95,8 @@ export interface VaultConflictResponse {
     | 'VAULT_NOT_INITIALIZED'
     | 'VAULT_ID_MISMATCH'
     | 'REVISION_CONFLICT'
+    | 'FORMAT_DOWNGRADE'
+    | 'SNAPSHOT_SEQUENCE_CONFLICT'
     | 'MUTATION_ID_PAYLOAD_MISMATCH';
   protocolVersion: typeof SYNC_PROTOCOL_VERSION;
   serverVaultId?: string;

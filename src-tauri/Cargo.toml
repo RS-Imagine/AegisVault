@@ -1,6 +1,6 @@
 [package]
 name = "aegis-vault-portable"
-version = "2.0.1"
+version = "2.1.0"
 description = "AegisVault V2 Zero-Knowledge Password Manager (True Portable Windows Edition)"
 authors = ["AegisVault"]
 edition = "2021"

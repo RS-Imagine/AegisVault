@@ -15,3 +15,5 @@ aegis-data/
 *.apk
 *.exe
 .dev.vars*
+test-results/
+playwright-report/

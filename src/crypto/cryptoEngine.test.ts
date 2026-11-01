@@ -6,7 +6,7 @@ import {
   DEFAULT_PBKDF2_ITERATIONS,
   MIN_PBKDF2_ITERATIONS,
   VAULT_FORMAT_VERSION,
-  buildEncryptedVaultPayload,
+  buildEncryptedVaultPayload as buildVaultPayload,
   createEphemeralDemoSession,
   deriveMasterKey,
   generateSaltBase64,
@@ -43,6 +43,19 @@ import type {
   SqlStorageCursor,
 } from '../../worker/src/VaultDurableObject';
 import type { CloudflareSyncConfig, DecryptedVaultRecord } from '../types/vault';
+
+// Frozen legacy protocol coverage remains important during the V3 rollout.
+const buildEncryptedVaultPayload: typeof buildVaultPayload = (key, salt, records, options) =>
+  buildVaultPayload(key, salt, records, { formatVersion: 2, ...options });
+
+async function pushTestVault(...args: Parameters<typeof SyncService.pushVault>) {
+  await SyncService.saveLocalVaultAsync(args[0], { markDirty: true });
+  return SyncService.pushVault(...args);
+}
+async function initializeTestVault(...args: Parameters<typeof SyncService.initializeCloudVault>) {
+  await SyncService.saveLocalVaultAsync(args[0], { markDirty: true });
+  return SyncService.initializeCloudVault(...args);
+}
 
 // Use 100,000 iterations in automated tests for fast execution while still exercising full WebCrypto PBKDF2 + AAD
 const TEST_ITERATIONS = MIN_PBKDF2_ITERATIONS;
@@ -216,7 +229,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
   });
 
   it('1. V2 Vault Creation, AAD Encryption/Decryption, and Default 600,000 PBKDF2 Standard', async () => {
-    assert.equal(VAULT_FORMAT_VERSION, 2);
+    assert.equal(VAULT_FORMAT_VERSION, 3);
     assert.equal(DEFAULT_PBKDF2_ITERATIONS, 600_000);
 
     const masterPassword = 'MasterPass#V2_Strong_2026!';
@@ -347,7 +360,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       { categories, iterations: TEST_ITERATIONS }
     );
 
-    SyncService.saveLocalVault(payload);
+    await SyncService.saveLocalVault(payload);
 
     // Verify no plaintext category key exists in localStorage and no plaintext string appears in any localStorage value
     assert.equal(env.localStore.has('aegis_zk_categories_v1'), false);
@@ -543,7 +556,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     );
 
     // 6d. Calling pushVault on uninitialized cloud without allowAutoInitIfEmpty does NOT overwrite or initialize silently
-    const pushWithoutInit = await SyncService.pushVault(vaultRev1, cfg, {
+    const pushWithoutInit = await pushTestVault(vaultRev1, cfg, {
       allowAutoInitIfEmpty: false,
     });
     assert.equal(pushWithoutInit.ok, false);
@@ -551,7 +564,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     assert.equal(pushWithoutInit.status, 'sync_pending');
 
     // 6e. Explicit initialization via POST /api/vault/init creates revision = 1
-    const initRes = await SyncService.initializeCloudVault(vaultRev1, cfg);
+    const initRes = await initializeTestVault(vaultRev1, cfg);
     assert.equal(initRes.ok, true);
     assert.equal(initRes.revision, 1);
     assert.equal(initRes.status, 'cloud_synced');
@@ -561,7 +574,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       ...SyncService.getLocalSyncState(),
       pendingMutationId: generateVaultId(),
     });
-    const duplicateInit = await SyncService.initializeCloudVault(vaultRev1, cfg);
+    const duplicateInit = await initializeTestVault(vaultRev1, cfg);
     assert.equal(duplicateInit.ok, false);
     assert.equal(duplicateInit.status, 'conflict');
     assert.equal(duplicateInit.conflict?.code, 'ALREADY_INITIALIZED');
@@ -584,7 +597,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       { vaultId, iterations: TEST_ITERATIONS }
     );
 
-    const putRes = await SyncService.pushVault(vaultRev2, cfg);
+    const putRes = await pushTestVault(vaultRev2, cfg);
     assert.equal(putRes.ok, true);
     assert.equal(putRes.revision, 2);
 
@@ -670,7 +683,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       [createSampleRecord({ id: 'rec-base', title: 'Base Record' })],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    await SyncService.initializeCloudVault(currentVault, cfg);
+    await initializeTestVault(currentVault, cfg);
 
     for (let rev = 2; rev <= 8; rev++) {
       currentVault = await buildEncryptedVaultPayload(
@@ -679,7 +692,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
         [createSampleRecord({ id: 'rec-base', title: `Record at Rev ${rev}` })],
         { vaultId, iterations: TEST_ITERATIONS }
       );
-      const res = await SyncService.pushVault(currentVault, cfg);
+      const res = await pushTestVault(currentVault, cfg);
       assert.equal(res.revision, rev);
     }
 
@@ -696,7 +709,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       ],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    const deviceAPush = await SyncService.pushVault(deviceAVaultRev9, cfg);
+    const deviceAPush = await pushTestVault(deviceAVaultRev9, cfg);
     assert.equal(deviceAPush.ok, true);
     assert.equal(deviceAPush.revision, 9);
 
@@ -711,12 +724,12 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       ],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    SyncService.saveLocalVault(deviceBVault, {
+    await SyncService.saveLocalVault(deviceBVault, {
       markDirty: true,
       syncedRevision: 8,
     });
 
-    const deviceBPush = await SyncService.pushVault(deviceBVault, cfg);
+    const deviceBPush = await pushTestVault(deviceBVault, cfg);
     assert.equal(deviceBPush.ok, false);
     assert.equal(deviceBPush.status, 'conflict');
     assert.equal(deviceBPush.conflict?.code, 'REVISION_CONFLICT');
@@ -780,7 +793,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       [createSampleRecord({ id: 'rec-1', title: 'Rev 1 Account' })],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    await SyncService.initializeCloudVault(rev1Payload, cfg);
+    await initializeTestVault(rev1Payload, cfg);
 
     const rev2Payload = await buildEncryptedVaultPayload(
       key,
@@ -791,7 +804,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       ],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    await SyncService.pushVault(rev2Payload, cfg);
+    await pushTestVault(rev2Payload, cfg);
 
     // 8a. Fresh Device B recovers from Cloud Durable Object
     const envB = setupSimulatedBrowserEnv({ doNamespace: sharedDoNamespace });
@@ -847,7 +860,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       newRotatedPassword,
       TEST_ITERATIONS
     );
-    const pushRotated = await SyncService.pushVault(rotated.newPayload, cfg, {
+    const pushRotated = await pushTestVault(rotated.newPayload, cfg, {
       purgePreviousSnapshots: true,
     });
     assert.equal(pushRotated.ok, true);
@@ -866,16 +879,16 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
         createSampleRecord({ id: 'rec-1', title: 'Rev 1 Account' }),
         createSampleRecord({ id: 'rec-offline', title: 'Offline Created Account' }),
       ],
-      { vaultId, iterations: TEST_ITERATIONS }
+      { vaultId, iterations: TEST_ITERATIONS, formatVersion: 3, previousPayload: rotated.newPayload }
     );
-    const offlinePush = await SyncService.pushVault(rev5Payload, cfg);
+    const offlinePush = await pushTestVault(rev5Payload, cfg);
     assert.equal(offlinePush.ok, false);
     assert.equal(offlinePush.status, 'offline');
     const pendingMutationId = SyncService.getLocalSyncState().pendingMutationId;
     assert.ok(pendingMutationId);
 
     envB.setOffline(false);
-    const onlineRetryPush = await SyncService.pushVault(rev5Payload, cfg);
+    const onlineRetryPush = await pushTestVault(rev5Payload, cfg);
     assert.equal(onlineRetryPush.ok, true);
     assert.equal(onlineRetryPush.revision, 5);
     assert.equal(SyncService.getLocalSyncState().pendingMutationId, null);
@@ -1151,7 +1164,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     });
 
     // 10b. Initialize cloud vault (POST /api/vault/init)
-    const initRes = await SyncService.initializeCloudVault(rev1Vault, cfg, {
+    const initRes = await initializeTestVault(rev1Vault, cfg, {
       retryBaseDelayMs: 10,
     });
     assert.equal(initRes.ok, true);
@@ -1169,7 +1182,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       { vaultId, iterations: TEST_ITERATIONS }
     );
 
-    const directPutRes = await SyncService.pushVault(rev2Vault, cfg, {
+    const directPutRes = await pushTestVault(rev2Vault, cfg, {
       retryBaseDelayMs: 10,
     });
     assert.equal(directPutRes.ok, true);
@@ -1199,7 +1212,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       { vaultId, iterations: TEST_ITERATIONS }
     );
     dropNextPutResponseAfterServerCommit = true;
-    const idempotentPushRes = await SyncService.pushVault(rev3Vault, cfg, {
+    const idempotentPushRes = await pushTestVault(rev3Vault, cfg, {
       maxRetries: 2,
       retryBaseDelayMs: 10,
     });
@@ -1209,10 +1222,10 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     assert.equal(idempotentPushRes.status, 'cloud_synced');
 
     // 10e. Payload-bound mutationId changes when payload changes, but stays stable when saving identical payload
-    SyncService.saveLocalVault(rev3Vault, { markDirty: true, syncedRevision: 3 });
+    await SyncService.saveLocalVault(rev3Vault, { markDirty: true, syncedRevision: 3 });
     const mutIdA = SyncService.getLocalSyncState().pendingMutationId;
     assert.ok(mutIdA);
-    SyncService.saveLocalVault(rev3Vault, { markDirty: true, syncedRevision: 3 });
+    await SyncService.saveLocalVault(rev3Vault, { markDirty: true, syncedRevision: 3 });
     const mutIdSame = SyncService.getLocalSyncState().pendingMutationId;
     assert.equal(mutIdSame, mutIdA);
 
@@ -1222,7 +1235,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
       [createSampleRecord({ id: 'rec-cn-4', title: 'Modified Payload' })],
       { vaultId, iterations: TEST_ITERATIONS }
     );
-    SyncService.saveLocalVault(rev4Vault, { markDirty: true, syncedRevision: 3 });
+    await SyncService.saveLocalVault(rev4Vault, { markDirty: true, syncedRevision: 3 });
     const mutIdDifferent = SyncService.getLocalSyncState().pendingMutationId;
     assert.notEqual(mutIdDifferent, mutIdA);
     assert.notEqual(
@@ -1247,12 +1260,12 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     );
 
     onDuringInFlightPut = async () => {
-      SyncService.saveLocalVault(rev5LocalEditDuringFlight, {
+      await SyncService.saveLocalVault(rev5LocalEditDuringFlight, {
         markDirty: true,
       });
     };
 
-    const inFlightRes = await SyncService.pushVault(rev4Vault, cfg, {
+    const inFlightRes = await pushTestVault(rev4Vault, cfg, {
       maxRetries: 0,
     });
     assert.equal(inFlightRes.ok, true);
@@ -1262,7 +1275,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
     assert.ok(SyncService.getLocalSyncState().pendingMutationId);
 
     // Pushing the newer edit now succeeds as Revision #5
-    const pushNewerEditRes = await SyncService.pushVault(
+    const pushNewerEditRes = await pushTestVault(
       rev5LocalEditDuringFlight,
       cfg,
       { maxRetries: 0 }
@@ -1273,7 +1286,7 @@ describe('AegisVault V2 Zero-Knowledge Crypto, Durable Objects & Sync Protocol S
 
     // 10g. Request timeout (AbortError) with maxRetries: 0 classifies as 'timeout' and preserves local data
     simulateNextRequestTimeout = true;
-    const timeoutRes = await SyncService.pushVault(
+    const timeoutRes = await pushTestVault(
       rev5LocalEditDuringFlight,
       cfg,
       { maxRetries: 0, timeoutMs: 500 }
