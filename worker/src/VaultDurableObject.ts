@@ -94,8 +94,28 @@ async function readBoundedJsonBody(request: Request): Promise<
   }
 
   let rawText = '';
+  const reader = request.body?.getReader();
   try {
-    rawText = await request.text();
+    if (reader) {
+      const decoder = new TextDecoder();
+      let byteLength = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        byteLength += value.byteLength;
+        if (byteLength > MAX_VAULT_BODY_BYTES) {
+          await reader.cancel().catch(() => undefined);
+          return {
+            ok: false,
+            status: 413,
+            errorCode: 'PAYLOAD_TOO_LARGE',
+            errorMessage: 'Payload Too Large: Maximum size is 1MB',
+          };
+        }
+        rawText += decoder.decode(value, { stream: true });
+      }
+      rawText += decoder.decode();
+    }
   } catch {
     return {
       ok: false,
@@ -103,16 +123,8 @@ async function readBoundedJsonBody(request: Request): Promise<
       errorCode: 'BAD_REQUEST_BODY',
       errorMessage: 'Bad Request: Unable to read request body',
     };
-  }
-
-  const byteLength = new TextEncoder().encode(rawText).byteLength;
-  if (byteLength > MAX_VAULT_BODY_BYTES) {
-    return {
-      ok: false,
-      status: 413,
-      errorCode: 'PAYLOAD_TOO_LARGE',
-      errorMessage: 'Payload Too Large: Maximum size is 1MB',
-    };
+  } finally {
+    reader?.releaseLock();
   }
 
   try {

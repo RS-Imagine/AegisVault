@@ -119,7 +119,7 @@ export default {
       );
     }
 
-    const authOrRateError = verifyRequestAuthAndRateLimit(
+    const authOrRateError = await verifyRequestAuthAndRateLimit(
       request,
       env.API_TOKEN,
       cors.headers

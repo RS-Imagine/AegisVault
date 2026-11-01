@@ -7,7 +7,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "tsx --test src/crypto/cryptoEngine.test.ts",
+    "test": "tsx --test src/crypto/cryptoEngine.test.ts src/security/securityRegression.test.ts",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "portable:win": "npm run build && npx @tauri-apps/cli@^2.0.0 build --no-bundle",
@@ -32,5 +32,8 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }

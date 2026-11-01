@@ -2,6 +2,10 @@
 
 AegisVault V2 是一款面向个人使用的零知识 (Zero-Knowledge) Web 端密码与银行卡管理器，采用 **React 19 + TypeScript + Vite + Web Crypto API** 构建，具备完整的 **PWA 离线冷启动能力**、**中国大陆网络零第三方阻塞优化**，并配备基于 **Cloudflare Worker + SQLite Durable Objects** 的强一致多设备密文同步架构。
 
+## 安全审阅状态
+
+本次代码审阅及修复、验证结果和剩余风险见 [CODE_REVIEW.md](./CODE_REVIEW.md)。目前 V2 逐条认证密文，尚未对整份记录清单与快照新鲜度提供密码学认证，因此不能保证检测到恶意存储方删除记录或回放旧快照。建议保留独立加密备份；本项目尚未经过独立安全审计。
+
 ---
 
 ## 核心安全与架构特性 (V2)
@@ -37,8 +41,8 @@ AegisVault V2 是一款面向个人使用的零知识 (Zero-Knowledge) Web 端�
 ## 本地开发与验证
 
 ```bash
-# 安装依赖
-npm install
+# 安装锁定版本依赖（Node.js >= 22.13）
+npm ci --legacy-peer-deps
 
 # 运行 V2 密码学、IndexedDB 一致性、弱网幂等同步与 SQLite Durable Object 自动化测试套件 (10 大测试集)
 npm test
@@ -72,7 +76,7 @@ npx wrangler secret put API_TOKEN
 - **零注册表/零 C 盘残留设计**：在 [`src-tauri/src/main.rs`](./src-tauri/src/main.rs) 中，程序启动时自动定位 `.exe` 所在目录并创建同级 `./aegis-data/` 文件夹，通过 `WEBVIEW2_USER_DATA_FOLDER` 与 `WebviewWindowBuilder::data_directory` 将所有加密 `IndexedDB` 与 `localStorage` 数据强制绑定在 `./aegis-data/` 内，可放入 U 盘或移动硬盘随身携带。
 - **本地构建命令**（需安装 Rust 工具链）：
   ```bash
-  npx @tauri-apps/cli@^2.0.0 icon public/icon-512.png
+  npx @tauri-apps/cli@^2.0.0 icon public/pwa-512x512.png
   npm run portable:win
   # 产物路径：src-tauri/target/release/aegis-vault-portable.exe
   ```

@@ -42,17 +42,10 @@ self.addEventListener('install', (event) => {
         )
       );
 
-      await Promise.allSettled(
-        uniqueUrls.map(async (targetUrl) => {
-          try {
-            const response = await fetch(targetUrl, { cache: 'reload' });
-            if (response && response.ok) {
-              await cache.put(targetUrl, response.clone());
-            }
-          } catch {
-            // Ignore individual asset failure during install in dev mode
-          }
-        })
+      // Installation must fail if any shell asset is unavailable. Otherwise a
+      // partial update could activate and delete the last working offline shell.
+      await cache.addAll(
+        uniqueUrls.map((targetUrl) => new Request(targetUrl, { cache: 'reload' }))
       );
 
       // If no controller is active yet (first install), activate immediately so offline works on next reload.

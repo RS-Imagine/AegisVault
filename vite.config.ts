@@ -44,11 +44,12 @@ function aegisVaultPwaPlugin(): Plugin {
 
       walk(resolvedOutDir);
 
-      const hash = crypto
-        .createHash('sha256')
-        .update(collectedRelativeAssets.sort().join('|'))
-        .digest('hex')
-        .slice(0, 12);
+      const versionHash = crypto.createHash('sha256');
+      for (const asset of collectedRelativeAssets.sort()) {
+        versionHash.update(asset);
+        versionHash.update(fs.readFileSync(path.join(resolvedOutDir, asset)));
+      }
+      const hash = versionHash.digest('hex').slice(0, 12);
 
       let swContent = fs.readFileSync(swPath, 'utf-8');
       swContent = swContent.replace('__AEGIS_SW_VERSION__', `v2-${hash}`);
@@ -66,7 +67,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), aegisVaultPwaPlugin()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, '.'),
+      '@': path.resolve(import.meta.dirname, '.'),
     },
   },
   server: {

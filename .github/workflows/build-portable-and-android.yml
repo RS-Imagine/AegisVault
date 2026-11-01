@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
   # ============================================================================
   # Job 1: Windows True Portable Edition (Single .exe + ./aegis-data USB-ready)
@@ -24,7 +27,7 @@ jobs:
 
       - name: Install frontend dependencies & run V2 security test suite
         run: |
-          npm install --legacy-peer-deps
+          npm ci --legacy-peer-deps
           npm test
           npm run build
 
@@ -77,7 +80,7 @@ jobs:
 
       - name: Build Web bundle & generate Capacitor Android project
         run: |
-          npm install --legacy-peer-deps
+          npm ci --legacy-peer-deps
           npm run build
           npm install --legacy-peer-deps @capacitor/core@^7.0.0 @capacitor/cli@^7.0.0 @capacitor/android@^7.0.0
           npx cap add android

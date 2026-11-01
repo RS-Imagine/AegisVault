@@ -27,18 +27,16 @@ export function resetWorkerRateLimiterForTests(): void {
   rateLimitStore.clear();
 }
 
-export function timingSafeEqualStrings(a: string, b: string): boolean {
+export async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
   const encoder = new TextEncoder();
-  const aBytes = encoder.encode(a);
-  const bBytes = encoder.encode(b);
-  const maxLen = Math.max(aBytes.byteLength, bBytes.byteLength);
-  let diff = aBytes.byteLength ^ bBytes.byteLength;
-  for (let i = 0; i < maxLen; i++) {
-    const byteA = i < aBytes.byteLength ? aBytes[i] : 0;
-    const byteB = i < bBytes.byteLength ? bBytes[i] : 0;
-    diff |= byteA ^ byteB;
-  }
-  return diff === 0 && aBytes.byteLength > 0;
+  if (!a || !b) return false;
+  // Delegate secret comparison to Web Crypto's native MAC verification rather
+  // than relying on JavaScript/JIT execution time for a byte comparison loop.
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(b), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(b));
+  return crypto.subtle.verify('HMAC', key, signature, encoder.encode(a));
 }
 
 export function getClientIp(request: Request): string {
@@ -120,11 +118,11 @@ export function hasForbiddenQueryToken(url: URL): boolean {
   );
 }
 
-export function verifyRequestAuthAndRateLimit(
+export async function verifyRequestAuthAndRateLimit(
   request: Request,
   configuredApiToken: string | undefined,
   corsHeaders: Record<string, string>
-): Response | null {
+): Promise<Response | null> {
   const clientIp = getClientIp(request);
   const now = Date.now();
   let bucket = rateLimitStore.get(clientIp);
@@ -174,7 +172,7 @@ export function verifyRequestAuthAndRateLimit(
     ? authHeader.slice(bearerPrefix.length).trim()
     : '';
 
-  if (!providedToken || !timingSafeEqualStrings(providedToken, cleanToken)) {
+  if (!providedToken || !(await timingSafeEqualStrings(providedToken, cleanToken))) {
     bucket.authFailures += 1;
     return new Response(
       JSON.stringify({ error: 'Unauthorized' }),

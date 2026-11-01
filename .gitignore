@@ -7,3 +7,11 @@ coverage/
 .env*
 .aistudio/
 .playwright-cli/
+src-tauri/target/
+src-tauri/icons/
+android/
+dist-portable/
+aegis-data/
+*.apk
+*.exe
+.dev.vars*

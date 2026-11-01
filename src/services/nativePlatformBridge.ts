@@ -150,29 +150,12 @@ export function matchRecordsForAndroidTarget(
       }
       const recUrl = (rec.url ?? '').trim().toLowerCase();
       const recDomain = (extractDomainFromUrl(rec.url) ?? '').toLowerCase();
-      const recTitle = rec.title.toLowerCase();
-
-      if (targetDomain && recDomain) {
-        if (
-          recDomain === targetDomain ||
-          recDomain.endsWith(`.${targetDomain}`) ||
-          targetDomain.endsWith(`.${recDomain}`)
-        ) {
-          return true;
-        }
-      }
-
+      // Match only an explicit origin/package association. Display titles and
+      // URL substrings are attacker-controlled and cannot authorize autofill.
       if (targetPkg) {
-        if (
-          recUrl.includes(targetPkg) ||
-          recUrl === `android://${targetPkg}` ||
-          targetPkg.includes(recTitle)
-        ) {
-          return true;
-        }
+        return recUrl === `android://${targetPkg}`;
       }
-
-      return false;
+      return Boolean(targetDomain && recDomain === targetDomain);
     })
     .map((rec) => ({
       id: rec.id,

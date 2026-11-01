@@ -26,14 +26,20 @@ function getRandomInt(max: number): number {
       ? window.crypto
       : globalThis.crypto;
   const array = new Uint32Array(1);
-  cryptoObj.getRandomValues(array);
+  // Rejection sampling avoids the bias introduced by modulo reduction.
+  const limit = 0x100000000 - (0x100000000 % max);
+  do {
+    cryptoObj.getRandomValues(array);
+  } while (array[0] >= limit);
   return array[0] % max;
 }
 
 export function generateStrongPassword(
   options: PasswordGeneratorOptions
 ): string {
-  const clampedLength = Math.max(6, Math.min(64, Math.floor(options.length)));
+  const clampedLength = Number.isFinite(options.length)
+    ? Math.max(6, Math.min(64, Math.floor(options.length)))
+    : 20;
 
   const activePools: string[] = [];
   if (options.uppercase) activePools.push(EXACT_SETS.uppercase);

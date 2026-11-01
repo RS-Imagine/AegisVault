@@ -1,6 +1,6 @@
 # AegisVault V2 Cloud Sync Worker (SQLite-backed Durable Objects)
 
-This directory (`worker/`) contains the standalone, production-ready Cloudflare Worker and **SQLite-backed Durable Object (`VaultDurableObject`)** backend for AegisVault V2 zero-knowledge encrypted synchronization.
+This directory (`worker/`) contains the standalone Cloudflare Worker and **SQLite-backed Durable Object (`VaultDurableObject`)** backend for AegisVault V2 encrypted synchronization. See [the code review](../CODE_REVIEW.md) for the V2 integrity limits and deployment validation still required.
 
 ## Why Durable Objects Instead of Cloudflare KV?
 
@@ -17,7 +17,7 @@ AegisVault V2 replaces KV entirely with a single-instance **SQLite-backed Durabl
 ## Security Architecture
 
 1. **Zero-Knowledge Ciphertext Only**: The Worker and Durable Object never receive or store your Master Password, derived keys, plaintext records, or plaintext category names. All records and custom categories are encrypted client-side with `AES-256-GCM` and Additional Authenticated Data (`AAD`).
-2. **Mandatory Bearer Token (`API_TOKEN`)**: Fails closed (`HTTP 503`) if `API_TOKEN` is missing or shorter than 16 characters. Verified using constant-time SHA-256 digest comparison (`timingSafeEqualStrings`).
+2. **Mandatory Bearer Token (`API_TOKEN`)**: Fails closed (`HTTP 503`) if `API_TOKEN` is missing or shorter than 16 characters. Compared through native Web Crypto HMAC-SHA-256 verification (`timingSafeEqualStrings`).
 3. **Query Parameter Token Protection**: Requests passing `?token=` or `?api_token=` in the URL are immediately rejected with `HTTP 400`.
 4. **Strict Payload & Schema Validation**: Enforces a 1 MiB body limit (`HTTP 413`) and validates the V2 envelope structure (`formatVersion: 2`, `vaultId`, `kdf`, `cipher`, `verifier`, `encryptedMetadata`, `encryptedRecords`) before entering the Durable Object transaction (`HTTP 422` on invalid schema).
 

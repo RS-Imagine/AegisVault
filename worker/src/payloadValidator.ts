@@ -5,6 +5,7 @@ import {
   V2EncryptedVaultPayload,
   VAULT_FORMAT_VERSION,
 } from './types';
+import { findUnexpectedEnvelopeField } from '../../shared/vaultEnvelopeSchema';
 
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const UUID_OR_ID_REGEX = /^[A-Za-z0-9_-]{16,64}$/;
@@ -61,6 +62,10 @@ export function validateV2VaultPayload(
   }
 
   const obj = payload as Record<string, unknown>;
+  const unexpectedField = findUnexpectedEnvelopeField(obj);
+  if (unexpectedField) {
+    return { valid: false, reason: `Unexpected field in encrypted envelope: ${unexpectedField}` };
+  }
 
   for (const forbidden of FORBIDDEN_PLAINTEXT_FIELDS) {
     if (forbidden in obj) {

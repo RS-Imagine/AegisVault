@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   CloudConflictInfo,
   CloudflareSyncConfig,
@@ -143,6 +143,8 @@ export default function App() {
   const [demoEncryptedPayload, setDemoEncryptedPayload] =
     useState<EncryptedVaultPayload | null>(null);
 
+  const sessionGeneration = useRef(0);
+
   // Zero-Knowledge In-Memory State (Destroyed immediately on Lock or Page Reload)
   const [memoryKey, setMemoryKey] = useState<CryptoKey | null>(null);
   const [memorySalt, setMemorySalt] = useState<string | null>(null);
@@ -193,76 +195,6 @@ export default function App() {
   const [isMasterPasswordModalOpen, setIsMasterPasswordModalOpen] =
     useState(false);
 
-  // Hydrate V2 vault from authoritative IndexedDB on startup & subscribe to cross-tab updates
-  useEffect(() => {
-    let cancelled = false;
-    void SyncService.hydrateFromIndexedDB()
-      .then((hydrated) => {
-        if (cancelled) return;
-        setEncryptedPayload(hydrated);
-        setSyncStatus(SyncService.computeSyncStatus());
-        setConflictInfo(SyncService.getLocalSyncState().conflictState);
-        setIsHydratingStorage(false);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setIsHydratingStorage(false);
-        }
-      });
-
-    const unsubscribe = subscribeToCrossTabVaultUpdates((event) => {
-      if (event.type === 'VAULT_RESET') {
-        setEncryptedPayload(null);
-        setMemoryKey(null);
-        setMemorySalt(null);
-        setDecryptedRecords([]);
-        setCategories(getInitialDefaultCategories());
-        setConflictInfo(null);
-        setSyncStatus('local_saved');
-        return;
-      }
-
-      const latestVault = SyncService.getLocalVault();
-      const latestSync = SyncService.getLocalSyncState();
-      setEncryptedPayload(latestVault);
-      setConflictInfo(latestSync.conflictState);
-      setSyncStatus(SyncService.computeSyncStatus());
-
-      // If vault is unlocked with matching key/salt, re-decrypt latest cross-tab snapshot in memory
-      if (
-        latestVault &&
-        memoryKey &&
-        memorySalt &&
-        latestVault.kdf.salt === memorySalt
-      ) {
-        void unlockEncryptedVaultPayload(latestVault, memoryKey)
-          .then((unlocked) => {
-            setDecryptedRecords(unlocked.records);
-            setCategories(unlocked.categories);
-          })
-          .catch(() => {
-            // If another tab rotated Master Password (different salt/key), keep safe state
-          });
-      }
-    });
-
-    const handleOnline = () => {
-      setSyncStatus(SyncService.computeSyncStatus());
-    };
-    const handleOffline = () => {
-      setSyncStatus(SyncService.computeSyncStatus(SyncService.getSyncConfig(), false));
-    };
-
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      cancelled = true;
-      unsubscribe();
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, [memoryKey, memorySalt]);
-
   const activeEncryptedEnvelopePayload = isDemoMode
     ? demoEncryptedPayload
     : encryptedPayload;
@@ -281,6 +213,7 @@ export default function App() {
   // First-time Production V2 Master Password Setup
   const handleSetupMasterPassword = useCallback(
     async (masterPassword: string, includeSeedData: boolean) => {
+      const generation = ++sessionGeneration.current;
       const salt = generateSaltBase64(16);
       const vaultId = generateVaultId();
       const derivedKey = await deriveMasterKey(masterPassword, salt);
@@ -300,6 +233,7 @@ export default function App() {
         }
       );
 
+      if (generation !== sessionGeneration.current) return;
       setIsDemoMode(false);
       setDemoEncryptedPayload(null);
 
@@ -323,6 +257,7 @@ export default function App() {
         setSyncMessage(`本地存储告警：${warning.message}`);
       }
 
+      if (generation !== sessionGeneration.current) return;
       setEncryptedPayload(payload);
       setMemoryKey(derivedKey);
       setMemorySalt(salt);
@@ -337,6 +272,7 @@ export default function App() {
   // Unlock Existing Formal V2 Encrypted Vault
   const handleUnlockVault = useCallback(
     async (masterPassword: string) => {
+      const generation = ++sessionGeneration.current;
       const localVault =
         SyncService.getLocalVault() ??
         (await SyncService.hydrateFromIndexedDB());
@@ -349,6 +285,7 @@ export default function App() {
         masterPassword
       );
 
+      if (generation !== sessionGeneration.current) return;
       setIsDemoMode(false);
       setDemoEncryptedPayload(null);
       setAutoLockNotice(null);
@@ -365,9 +302,11 @@ export default function App() {
 
   // Enter Strictly Isolated In-Memory Demo Sandbox (Never touches localStorage/IndexedDB or Cloudflare Worker)
   const handleEnterIsolatedDemoMode = useCallback(async () => {
+    const generation = ++sessionGeneration.current;
     const demoRecords = createInitialSeedRecords();
     const session = await createEphemeralDemoSession(demoRecords);
 
+    if (generation !== sessionGeneration.current) return;
     setIsDemoMode(true);
     setAutoLockNotice(null);
     setDemoEncryptedPayload(session.ephemeralPayload);
@@ -381,6 +320,7 @@ export default function App() {
 
   // Immediate One-Click Lock (Wipes Key, Plaintext, and Demo Sandbox from React State)
   const handleLockVault = useCallback(() => {
+    sessionGeneration.current += 1;
     setMemoryKey(null);
     setMemorySalt(null);
     setDecryptedRecords([]);
@@ -389,6 +329,9 @@ export default function App() {
     setDemoEncryptedPayload(null);
     setEncryptedPayload(SyncService.getLocalVault());
     setEditingRecord(null);
+    setPrefillRecordDraft(null);
+    setIsGeneratorModalOpen(false);
+    setIsCloudSyncModalOpen(false);
     setIsRecordModalOpen(false);
     setIsImportModalOpen(false);
     setIsCategoryModalOpen(false);
@@ -396,6 +339,84 @@ export default function App() {
     setStagedPull(null);
     setNeedsRemotePasswordPrompt(false);
   }, []);
+
+  // Hydrate V2 vault from authoritative IndexedDB on startup & subscribe to cross-tab updates
+  useEffect(() => {
+    let cancelled = false;
+    let crossTabReadSequence = 0;
+    const generation = sessionGeneration.current;
+    void SyncService.hydrateFromIndexedDB()
+      .then((hydrated) => {
+        if (cancelled || generation !== sessionGeneration.current) return;
+        setEncryptedPayload(hydrated);
+        setSyncStatus(SyncService.computeSyncStatus());
+        setConflictInfo(SyncService.getLocalSyncState().conflictState);
+        setIsHydratingStorage(false);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIsHydratingStorage(false);
+        }
+      });
+
+    const unsubscribe = subscribeToCrossTabVaultUpdates((event) => {
+      const readSequence = ++crossTabReadSequence;
+      if (event.type === 'VAULT_RESET') {
+        handleLockVault();
+        setEncryptedPayload(null);
+        setConflictInfo(null);
+        setSyncStatus('local_saved');
+        return;
+      }
+
+      const latestVault = SyncService.getLocalVault();
+      const latestSync = SyncService.getLocalSyncState();
+      setEncryptedPayload(latestVault);
+      setConflictInfo(latestSync.conflictState);
+      setSyncStatus(SyncService.computeSyncStatus());
+
+      // A key rotation or vault replacement invalidates the current session.
+      // Keeping the old key would allow the next edit to corrupt the new vault.
+      if (memoryKey && (!latestVault || latestVault.kdf.salt !== memorySalt ||
+          latestVault.vaultId !== encryptedPayload?.vaultId)) {
+        handleLockVault();
+        setAutoLockNotice('其他标签页已更换密码库或主密码，请重新解锁。');
+        return;
+      }
+      if (latestVault && memoryKey) {
+        const updateGeneration = sessionGeneration.current;
+        void unlockEncryptedVaultPayload(latestVault, memoryKey)
+          .then((unlocked) => {
+            if (cancelled || updateGeneration !== sessionGeneration.current ||
+                readSequence !== crossTabReadSequence) return;
+            setDecryptedRecords(unlocked.records);
+            setCategories(unlocked.categories);
+          })
+          .catch(() => {
+            if (!cancelled && updateGeneration === sessionGeneration.current) {
+              handleLockVault();
+            }
+          });
+      }
+
+    });
+
+    const handleOnline = () => {
+      setSyncStatus(SyncService.computeSyncStatus());
+    };
+    const handleOffline = () => {
+      setSyncStatus(SyncService.computeSyncStatus(SyncService.getSyncConfig(), false));
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [memoryKey, memorySalt, encryptedPayload?.vaultId, handleLockVault]);
 
   // Automatic Idle Vault Lock (wipes in-memory CryptoKey & plaintext after 5 minutes of user inactivity)
   useEffect(() => {
@@ -441,6 +462,7 @@ export default function App() {
 
   // Reset Local Vault (atomically wipes both IndexedDB and localStorage V2 keys, increments resetEpoch)
   const handleResetVault = useCallback(() => {
+    handleLockVault();
     const existing = SyncService.getLocalVault();
     if (existing) {
       SyncService.saveRollbackBackup(existing);
@@ -457,7 +479,7 @@ export default function App() {
     setRecoverySummary(null);
     setConflictInfo(null);
     setPersistenceWarning(null);
-  }, []);
+  }, [handleLockVault]);
 
   // Probe Remote Vault without modifying localStorage
   const handleProbeCloudVault = useCallback(
@@ -482,7 +504,9 @@ export default function App() {
       syncConfigToSave?: CloudflareSyncConfig;
       confirmOverwriteExistingLocal?: boolean;
     }) => {
+      const generation = ++sessionGeneration.current;
       const result = await SyncService.verifyAndCommitRecoveryPayload(params);
+      if (generation !== sessionGeneration.current) return;
 
       setIsDemoMode(false);
       setDemoEncryptedPayload(null);
@@ -518,6 +542,7 @@ export default function App() {
 
   // Rollback to previous local vault before recovery/overwrite
   const handleRollbackToPreviousLocalVault = useCallback(() => {
+    handleLockVault();
     const restored = SyncService.restoreFromRollbackBackup();
     if (!restored) return;
     setMemoryKey(null);
@@ -530,7 +555,7 @@ export default function App() {
     setRecoverySummary(null);
     setSyncStatus(SyncService.computeSyncStatus());
     setSyncMessage('已回退至覆盖前的原有本地加密密码库，请输入原主密码解锁');
-  }, []);
+  }, [handleLockVault]);
 
   // V2 Master Password Change / Key Rotation (Preserves vaultId, generates new salt & key, re-encrypts all data)
   const handleRotateMasterPassword = useCallback(
@@ -542,6 +567,7 @@ export default function App() {
       if (isDemoMode) {
         throw new Error('演示沙盒不支持主密码轮换，请先返回正式密码库');
       }
+      const generation = sessionGeneration.current;
       const currentVault = encryptedPayload ?? SyncService.getLocalVault();
       if (!currentVault) {
         throw new Error('未找到可轮换主密码的本地 V2 密码库');
@@ -558,11 +584,13 @@ export default function App() {
           currentVault.kdf.iterations
         );
 
+        if (generation !== sessionGeneration.current) return;
         await SyncService.saveLocalVaultAsync(rotated.newPayload, {
           markDirty: true,
           pendingPasswordRotationPurge: purgePreviousCloudSnapshots,
         });
 
+        if (generation !== sessionGeneration.current) return;
         setPersistenceWarning(null);
         setEncryptedPayload(rotated.newPayload);
         setMemoryKey(rotated.newKey);
@@ -574,7 +602,9 @@ export default function App() {
           '已完成 V2 主密码与密钥轮换（vaultId 保持不变，本地 IndexedDB 已更新，待同步云端）'
         );
       } catch (err) {
-        SyncService.saveLocalVault(currentVault, { markDirty: false });
+        if (generation === sessionGeneration.current) {
+          SyncService.saveLocalVault(currentVault, { markDirty: false });
+        }
         throw err;
       }
     },
@@ -591,6 +621,7 @@ export default function App() {
         throw new Error('密码库已锁定，内存密钥不存在');
       }
 
+      const generation = sessionGeneration.current;
       const effectiveCategories = syncCategoriesWithRecords(
         nextCategoriesOverride ?? categories,
         nextRecords
@@ -610,6 +641,7 @@ export default function App() {
             existingVerifier: demoEncryptedPayload?.verifier,
           }
         );
+        if (generation !== sessionGeneration.current) return;
         setDemoEncryptedPayload(nextDemoPayload);
         setDecryptedRecords(nextRecords);
         setCategories(effectiveCategories);
@@ -629,6 +661,7 @@ export default function App() {
         }
       );
 
+      if (generation !== sessionGeneration.current) return;
       // Always keep in-memory state intact even if disk/IndexedDB throws QuotaExceededError
       setEncryptedPayload(nextPayload);
       setDecryptedRecords(nextRecords);
@@ -727,7 +760,7 @@ export default function App() {
       } else {
         const newRecord: DecryptedVaultRecord = {
           ...recordData,
-          id: `rec-${now}-${Math.random().toString(36).slice(2, 7)}`,
+          id: generateVaultId(),
           createdAt: now,
           updatedAt: now,
         };
@@ -858,6 +891,7 @@ export default function App() {
         return;
       }
 
+      const generation = sessionGeneration.current;
       SyncService.saveSyncConfig(cfg);
       setSyncConfig(SyncService.getSyncConfig());
       setSyncStatus('syncing');
@@ -865,6 +899,7 @@ export default function App() {
 
       try {
         const res = await SyncService.pullVault(cfg);
+        if (generation !== sessionGeneration.current) return;
         if (!res.initialized || !res.payload) {
           setSyncStatus('failed');
           setSyncMessage('云端 Durable Object 尚未初始化加密密码库');
@@ -880,6 +915,7 @@ export default function App() {
           localPayload: encryptedPayload,
         });
 
+        if (generation !== sessionGeneration.current) return;
         setNeedsRemotePasswordPrompt(false);
 
         if (staged.hasConflictWithLocal && encryptedPayload) {
@@ -955,6 +991,7 @@ export default function App() {
       resolution: 'use_cloud' | 'keep_local_and_push',
       remotePassword?: string
     ) => {
+      const generation = sessionGeneration.current;
       const res = await SyncService.resolveConflict({
         resolution,
         config: syncConfig,
@@ -969,6 +1006,7 @@ export default function App() {
       setConflictInfo(SyncService.getLocalSyncState().conflictState);
       setHasRollbackBackup(Boolean(SyncService.getRollbackBackup()));
 
+      if (generation !== sessionGeneration.current) return;
       if (res.stagedCloud) {
         setEncryptedPayload(res.stagedCloud.remotePayload);
         setMemoryKey(res.stagedCloud.derivedKey);
@@ -983,6 +1021,7 @@ export default function App() {
   // Restore Historical Cloud Snapshot (`GET /api/vault/history/:revision`)
   const handleRestoreHistorySnapshot = useCallback(
     async (revision: number, snapshotPassword?: string) => {
+      const generation = sessionGeneration.current;
       const restored = await SyncService.restoreCloudHistorySnapshot({
         revision,
         config: syncConfig,
@@ -991,6 +1030,7 @@ export default function App() {
         currentMemorySalt: memorySalt,
       });
 
+      if (generation !== sessionGeneration.current) return;
       setEncryptedPayload(restored.payload);
       setMemoryKey(restored.key);
       setMemorySalt(restored.payload.kdf.salt);
@@ -1184,25 +1224,29 @@ export default function App() {
       )}
 
       {/* Modals */}
-      <RecordFormModal
-        isOpen={isRecordModalOpen}
-        onClose={() => {
-          setIsRecordModalOpen(false);
-          setEditingRecord(null);
-          setPrefillRecordDraft(null);
-        }}
-        onSave={handleSaveRecord}
-        editingRecord={editingRecord}
-        prefillDraft={prefillRecordDraft}
-        categories={categories}
-        onOpenCategoryManager={() => setIsCategoryModalOpen(true)}
-        onQuickCreateCategory={handleCreateCategory}
-      />
+      {isUnlocked && isRecordModalOpen && (
+        <RecordFormModal
+          isOpen={isRecordModalOpen}
+          onClose={() => {
+            setIsRecordModalOpen(false);
+            setEditingRecord(null);
+            setPrefillRecordDraft(null);
+          }}
+          onSave={handleSaveRecord}
+          editingRecord={editingRecord}
+          prefillDraft={prefillRecordDraft}
+          categories={categories}
+          onOpenCategoryManager={() => setIsCategoryModalOpen(true)}
+          onQuickCreateCategory={handleCreateCategory}
+        />
+      )}
 
-      <PasswordGeneratorModal
-        isOpen={isGeneratorModalOpen}
-        onClose={() => setIsGeneratorModalOpen(false)}
-      />
+      {isUnlocked && isGeneratorModalOpen && (
+        <PasswordGeneratorModal
+          isOpen={isGeneratorModalOpen}
+          onClose={() => setIsGeneratorModalOpen(false)}
+        />
+      )}
 
       <CiphertextInspectorModal
         isOpen={isCiphertextModalOpen}
@@ -1214,58 +1258,66 @@ export default function App() {
         }
       />
 
-      <CloudSyncModal
-        isOpen={isCloudSyncModalOpen}
-        onClose={() => setIsCloudSyncModalOpen(false)}
-        isDemoMode={isDemoMode}
-        config={syncConfig}
-        syncStatus={syncStatus}
-        statusMessage={syncMessage}
-        stagedPull={stagedPull}
-        needsRemotePasswordPrompt={needsRemotePasswordPrompt}
-        requiresCloudInitConfirmation={requiresCloudInitConfirm}
-        conflictInfo={conflictInfo}
-        onSaveConfig={handleSaveSyncConfig}
-        onClearToken={handleClearApiToken}
-        onTriggerPush={handleTriggerPush}
-        onTriggerPull={handleTriggerPull}
-        onConfirmStagedPull={handleConfirmStagedPull}
-        onCancelStagedPull={handleCancelStagedPull}
-        onResolveConflict={handleResolveConflict}
-        onRestoreHistorySnapshot={handleRestoreHistorySnapshot}
-        onExportLocalBackup={
-          encryptedPayload ? handleExportEncryptedVault : undefined
-        }
-      />
+      {isUnlocked && isCloudSyncModalOpen && (
+        <CloudSyncModal
+          isOpen={isCloudSyncModalOpen}
+          onClose={() => setIsCloudSyncModalOpen(false)}
+          isDemoMode={isDemoMode}
+          config={syncConfig}
+          syncStatus={syncStatus}
+          statusMessage={syncMessage}
+          stagedPull={stagedPull}
+          needsRemotePasswordPrompt={needsRemotePasswordPrompt}
+          requiresCloudInitConfirmation={requiresCloudInitConfirm}
+          conflictInfo={conflictInfo}
+          onSaveConfig={handleSaveSyncConfig}
+          onClearToken={handleClearApiToken}
+          onTriggerPush={handleTriggerPush}
+          onTriggerPull={handleTriggerPull}
+          onConfirmStagedPull={handleConfirmStagedPull}
+          onCancelStagedPull={handleCancelStagedPull}
+          onResolveConflict={handleResolveConflict}
+          onRestoreHistorySnapshot={handleRestoreHistorySnapshot}
+          onExportLocalBackup={
+            encryptedPayload ? handleExportEncryptedVault : undefined
+          }
+        />
+      )}
 
-      <ImportVaultModal
-        isOpen={isImportModalOpen}
-        onClose={() => setIsImportModalOpen(false)}
-        existingRecords={decryptedRecords}
-        currentMemoryKey={memoryKey}
-        currentEncryptedPayload={activeEncryptedEnvelopePayload}
-        onConfirmMerge={persistUpdatedVault}
-      />
+      {isUnlocked && isImportModalOpen && (
+        <ImportVaultModal
+          isOpen={isImportModalOpen}
+          onClose={() => setIsImportModalOpen(false)}
+          existingRecords={decryptedRecords}
+          currentMemoryKey={memoryKey}
+          currentEncryptedPayload={activeEncryptedEnvelopePayload}
+          onConfirmMerge={persistUpdatedVault}
+        />
+      )}
 
-      <CategoryManagerModal
-        isOpen={isCategoryModalOpen}
-        onClose={() => setIsCategoryModalOpen(false)}
-        categories={categories}
-        records={decryptedRecords}
-        onCreateCategory={async (label) => {
-          await handleCreateCategory(label);
-        }}
-        onRenameCategory={handleRenameCategory}
-        onDeleteCategory={handleDeleteCategory}
-      />
+      {isUnlocked && isCategoryModalOpen && (
+        <CategoryManagerModal
+          isOpen={isCategoryModalOpen}
+          onClose={() => setIsCategoryModalOpen(false)}
+          categories={categories}
+          records={decryptedRecords}
+          onCreateCategory={async (label) => {
+            await handleCreateCategory(label);
+          }}
+          onRenameCategory={handleRenameCategory}
+          onDeleteCategory={handleDeleteCategory}
+        />
+      )}
 
-      <MasterPasswordModal
-        isOpen={isMasterPasswordModalOpen}
-        vaultId={encryptedPayload?.vaultId}
-        onClose={() => setIsMasterPasswordModalOpen(false)}
-        onExportBackupBeforeRotation={handleExportEncryptedVault}
-        onRotateMasterPassword={handleRotateMasterPassword}
-      />
+      {isUnlocked && isMasterPasswordModalOpen && (
+        <MasterPasswordModal
+          isOpen={isMasterPasswordModalOpen}
+          vaultId={encryptedPayload?.vaultId}
+          onClose={() => setIsMasterPasswordModalOpen(false)}
+          onExportBackupBeforeRotation={handleExportEncryptedVault}
+          onRotateMasterPassword={handleRotateMasterPassword}
+        />
+      )}
     </>
   );
 }

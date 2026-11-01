@@ -54,6 +54,7 @@ const IDB_DATABASE_VERSION = 1;
 const IDB_STORE_VAULT = 'vault_store';
 const IDB_STORE_SYNC = 'sync_state_store';
 const CROSS_TAB_CHANNEL_NAME = 'aegis_vault_v2_channel';
+const TAB_INSTANCE_ID = globalThis.crypto.randomUUID();
 
 interface StorageMetaState {
   writeSequence: number;
@@ -98,24 +99,9 @@ let simulatedPersistenceFailureForTests: {
 export function computePayloadContentSignature(
   payload: EncryptedVaultPayload
 ): string {
-  const canonical = JSON.stringify({
-    formatVersion: payload.formatVersion,
-    vaultId: payload.vaultId,
-    kdf: payload.kdf,
-    cipher: payload.cipher,
-    verifier: payload.verifier,
-    encryptedMetadata: payload.encryptedMetadata,
-    encryptedRecords: [...payload.encryptedRecords]
-      .sort((a, b) => a.id.localeCompare(b.id))
-      .map((r) => ({
-        id: r.id,
-        recordType: r.recordType,
-        iv: r.iv,
-        ciphertext: r.ciphertext,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-      })),
-  });
+  // The server hashes the serialized envelope, including timestamps and record
+  // order. Reuse a mutation ID only for exactly that same request snapshot.
+  const canonical = JSON.stringify(payload);
 
   // 64-bit FNV-1a dual-hash for fast synchronous deterministic fingerprinting
   let h1 = 0x811c9dc5;
@@ -409,6 +395,7 @@ function getActiveIdbAdapter(): PluggableIdbAdapter {
 }
 
 export interface CrossTabVaultEvent {
+  sourceId?: string;
   type: 'VAULT_UPDATED' | 'SYNC_STATE_UPDATED' | 'VAULT_RESET';
   vaultId: string;
   updatedAt: string;
@@ -421,7 +408,7 @@ function broadcastCrossTabUpdate(event: CrossTabVaultEvent): void {
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const bc = new BroadcastChannel(CROSS_TAB_CHANNEL_NAME);
-      bc.postMessage(event);
+      bc.postMessage({ ...event, sourceId: TAB_INSTANCE_ID });
       bc.close();
     }
   } catch {
@@ -439,6 +426,7 @@ export function subscribeToCrossTabVaultUpdates(
       bc.onmessage = (msg) => {
         if (msg.data && typeof msg.data === 'object' && 'type' in msg.data) {
           const incoming = msg.data as CrossTabVaultEvent;
+          if (incoming.sourceId === TAB_INSTANCE_ID) return;
           if (
             typeof incoming.resetEpoch === 'number' &&
             incoming.resetEpoch > memoryResetEpoch

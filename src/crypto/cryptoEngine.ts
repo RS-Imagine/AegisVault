@@ -26,6 +26,7 @@ import {
   sanitizeCategoriesList,
   syncCategoriesWithRecords,
 } from '../utils/categoryManager';
+import { findUnexpectedEnvelopeField } from '../../shared/vaultEnvelopeSchema';
 
 export const VAULT_FORMAT_VERSION = 2 as const;
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
@@ -369,6 +370,10 @@ export function validateV2VaultEnvelopeStructure(
       valid: false,
       reason: '不再支持旧版 V1 密码库格式，请使用 AegisVault V2 格式 (formatVersion: 2)',
     };
+  }
+  const unexpectedField = findUnexpectedEnvelopeField(obj);
+  if (unexpectedField) {
+    return { valid: false, reason: `密文信封包含未允许字段：${unexpectedField}` };
   }
 
   if (obj.formatVersion !== VAULT_FORMAT_VERSION) {
