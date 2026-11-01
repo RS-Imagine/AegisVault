@@ -65,11 +65,6 @@ function aegisVaultPwaPlugin(): Plugin {
 export default defineConfig({
   base: './',
   plugins: [react(), tailwindcss(), aegisVaultPwaPlugin()],
-  resolve: {
-    alias: {
-      '@': path.resolve(import.meta.dirname, '.'),
-    },
-  },
   server: {
     hmr: process.env.DISABLE_HMR !== 'true',
   },

@@ -6,13 +6,6 @@ export interface PasswordGeneratorOptions {
   symbols: boolean;
 }
 
-const CHAR_SETS = {
-  uppercase: 'ABCDEFGHJKLMNPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ',
-  lowercase: 'abcdefghijkmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
-  numbers: '0123456789',
-  symbols: '!@#$%^&*()-_=+[]{}|;:,.<>?',
-};
-
 const EXACT_SETS = {
   uppercase: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
   lowercase: 'abcdefghijklmnopqrstuvwxyz',
@@ -142,5 +135,3 @@ export function evaluatePasswordStrength(password: string): PasswordStrengthInfo
     barColorClass: 'bg-blue-600',
   };
 }
-
-export const CHAR_POOL_REFERENCE = CHAR_SETS;

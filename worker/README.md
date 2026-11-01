@@ -1,6 +1,6 @@
 # AegisVault V2 Cloud Sync Worker (SQLite-backed Durable Objects)
 
-This directory (`worker/`) contains the standalone Cloudflare Worker and **SQLite-backed Durable Object (`VaultDurableObject`)** backend for AegisVault V2 encrypted synchronization. See [the code review](../CODE_REVIEW.md) for the V2 integrity limits and deployment validation still required.
+This directory (`worker/`) contains the standalone Cloudflare Worker and **SQLite-backed Durable Object (`VaultDurableObject`)** backend for AegisVault V2 encrypted synchronization. See [the code review](../docs/security-review.md) for the V2 integrity limits and deployment validation still required.
 
 ## Why Durable Objects Instead of Cloudflare KV?
 

@@ -1,100 +1,168 @@
-name: Build Windows Portable EXE & Android Base APK
+name: Build and publish Windows and Android
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-jobs:
-  # ============================================================================
-  # Job 1: Windows True Portable Edition (Single .exe + ./aegis-data USB-ready)
-  # ============================================================================
-  build-windows-portable:
-    name: Windows 绿色便携版 (.exe)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: false
 
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install frontend dependencies & run V2 security test suite
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - name: Check native versions and release tag
+        id: version
+        shell: bash
         run: |
-          npm ci --legacy-peer-deps
-          npm test
-          npm run build
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const version = JSON.parse(fs.readFileSync('package.json')).version;
+          const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json')).version;
+          const cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = "([^"]+)"/m)[1];
+          assert.equal(tauri, version);
+          assert.equal(cargo, version);
+          if (process.env.GITHUB_REF_TYPE === 'tag') {
+            const tag = process.env.GITHUB_REF_NAME;
+            assert.ok(tag === `v${version}` || tag.startsWith(`v${version}-`), 'Tag must match package version');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          JS
+      - run: npm run lint
+      - run: npm test
 
-      - name: Setup Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust cargo build artifacts
-        uses: Swatinem/rust-cache@v2
+  windows:
+    name: Windows x64 portable
+    needs: validate
+    runs-on: windows-latest
+    env:
+      APP_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          workspaces: './src-tauri -> target'
-
-      - name: Generate Windows icon & compile standalone Portable EXE
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci --legacy-peer-deps
+      - run: npm run native:icons
+      - run: npm run portable:win
+      - name: Check executable startup and portable storage
         shell: pwsh
         run: |
-          npx --yes @tauri-apps/cli@^2.0.0 icon public/pwa-512x512.png
-          npx --yes @tauri-apps/cli@^2.0.0 build --no-bundle
-          New-Item -ItemType Directory -Force -Path dist-portable/aegis-data | Out-Null
-          Copy-Item "src-tauri/target/release/aegis-vault-portable.exe" "dist-portable/AegisVault-Portable.exe"
-          Set-Content -Path "dist-portable/README-便携版说明.txt" -Value "AegisVault V2 绿色便携版`r`n1. 直接双击 AegisVault-Portable.exe 即可运行（免安装）。`r`n2. 所有加密密码库数据均保存在同级目录的 aegis-data 文件夹中，可随 U 盘或移动硬盘任意迁移，不在系统 C 盘残留数据。" -Encoding UTF8
-
-      - name: Upload Windows True Portable Artifact
-        uses: actions/upload-artifact@v4
+          $exe = Resolve-Path 'src-tauri/target/release/aegis-vault-portable.exe'
+          $appProcess = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 10
+            if ($appProcess.HasExited) { throw "Portable app exited with code $($appProcess.ExitCode)" }
+            if (-not (Test-Path 'src-tauri/target/release/aegis-data')) { throw 'Portable storage directory was not created' }
+          } finally {
+            if (-not $appProcess.HasExited) { Stop-Process -Id $appProcess.Id -Force }
+          }
+      - name: Package portable app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-portable/aegis-data, release | Out-Null
+          Copy-Item src-tauri/target/release/aegis-vault-portable.exe dist-portable/AegisVault-Portable.exe
+          @'
+          AegisVault Windows x64 便携预览版
+          解压到可写目录后运行 AegisVault-Portable.exe。
+          密码库数据位于同级 aegis-data 目录；移动或备份时保留整个目录。
+          需要 Microsoft Edge WebView2 Runtime。此 EXE 未进行代码签名。
+          升级前请先导出加密备份。安全限制请参阅仓库 README。
+          '@ | Set-Content dist-portable/README.txt -Encoding UTF8
+          Compress-Archive -Path dist-portable/* -DestinationPath "release/AegisVault-${env:APP_VERSION}-Windows-x64-portable.zip"
+      - uses: actions/upload-artifact@v4
         with:
-          name: AegisVault-Windows-Portable-x64
-          path: dist-portable/
+          name: aegis-release-windows
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 14
 
-  # ============================================================================
-  # Job 2: Foundational Android App (.apk with Autofill Bridge ready)
-  # ============================================================================
-  build-android-apk:
-    name: Android 基础版安装包 (.apk)
+  android:
+    name: Android test APK
+    needs: validate
     runs-on: ubuntu-latest
+    env:
+      APP_VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Setup Java 21 for Android Gradle build
-        uses: actions/setup-java@v4
+          cache: npm
+      - uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '21'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Build Web bundle & generate Capacitor Android project
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci --legacy-peer-deps
+      - run: npm run android:init
+      - name: Build and verify installable test APK
+        shell: bash
         run: |
-          npm ci --legacy-peer-deps
-          npm run build
-          npm install --legacy-peer-deps @capacitor/core@^7.0.0 @capacitor/cli@^7.0.0 @capacitor/android@^7.0.0
-          npx cap add android
-          npx cap sync android
-
-      - name: Assemble Android APK
-        working-directory: android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../AegisVault-Android-v2.0.0.apk
-
-      - name: Upload Android Base APK Artifact
-        uses: actions/upload-artifact@v4
+          chmod +x android/gradlew
+          (cd android && ./gradlew assembleDebug --no-daemon)
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$build_tools/apksigner" verify --verbose "$apk"
+          "$build_tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/apk-badging.txt"
+          head -5 "$RUNNER_TEMP/apk-badging.txt"
+          mkdir -p release
+          cp "$apk" "release/AegisVault-$APP_VERSION-Android-test.apk"
+      - uses: actions/upload-artifact@v4
         with:
-          name: AegisVault-Android-Base-APK
-          path: AegisVault-Android-v2.0.0.apk
+          name: aegis-release-android
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub prerelease
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, windows, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: aegis-release-*
+          path: release
+          merge-multiple: true
+      - name: Create checksums and publish verified assets
+        shell: bash
+        run: |
+          (cd release && sha256sum *.zip *.apk > SHA256SUMS.txt)
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Windows 和 Android 首次公开预览构建。
+
+          - Windows x64：下载 portable.zip，解压到可写目录后运行 EXE；保留同级 aegis-data 目录。需要 WebView2 Runtime，EXE 未进行代码签名。
+          - Android：下载 Android-test.apk，允许安装来自该来源的应用。这是调试签名测试版，不是正式签名版；不同预览构建可能需要备份后卸载重装。
+          - SHA256SUMS.txt 提供文件完整性校验。
+
+          本版本保留 V2 格式，尚不能检测恶意存储方删减整份记录清单或回放旧快照；请保留独立加密备份。Android 系统级自动填充仍未实现。
+          NOTES
+          gh release create "$RELEASE_TAG" release/* --verify-tag --prerelease --title "AegisVault $RELEASE_TAG — Windows & Android Preview" --notes-file "$RUNNER_TEMP/release-notes.md"
