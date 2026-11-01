@@ -113,7 +113,16 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Install required Android SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+        shell: bash
+        run: |
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdk_manager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdk_manager"
+          set +o pipefail
+          yes | "$sdk_manager" --licenses > /dev/null
+          set -o pipefail
+          "$sdk_manager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
       - uses: gradle/actions/setup-gradle@v4
       - run: npm ci --legacy-peer-deps
       - run: npm run android:init
