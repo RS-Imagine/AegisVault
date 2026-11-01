@@ -36,7 +36,7 @@
 - Chromium：真实的两标签页主密码轮换，旧会话锁定、新主密码解锁，以及自动锁定后未保存明文草稿丢弃均通过。
 - 依据 `@cloudflare/workers-types@5.20261101.1` 验证现有 Worker handler、Durable Object namespace/state 结构兼容，类型检查通过；未对线上 Cloudflare 运行时进行部署测试。
 - `npm audit`（含开发依赖）报告 0 个已知漏洞。常见 GitHub/AWS/API 密钥与私钥格式扫描未命中，代码中的 DemoOnly 和测试凭证为示例数据。此扫描不能证明不存在任何秘密。
-- 未运行 Windows EXE/Android APK 原生构建，也未验证真实 Android AutofillService。仓库保留相应手动构建工作流。
+- 后续原生发布验证：[`v2.0.1-preview.3`](https://github.com/RS-Imagine/AegisVault/releases/tag/v2.0.1-preview.3) 的 Windows/Android 构建均通过；Windows EXE 启动与便携目录检查、Android APK 签名与包版本验证通过，发布下载文件的 SHA-256 已复核。[构建记录](https://github.com/RS-Imagine/AegisVault/actions/runs/41310407035)。Android 为调试签名测试版，尚未进行真实设备或系统级自动填充验证。
 
 ## 复现常规检查
 

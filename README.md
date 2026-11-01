@@ -60,7 +60,7 @@ APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`。已生成 Andro
 
 [原生发布工作流](.github/workflows/build-portable-and-android.yml) 在推送 `v*` 标签时运行测试、Windows 构建与启动检查、Android 构建与 APK 签名验证；两平台均成功后发布 GitHub 预发布版本和校验文件。手动运行可只构建临时产物。
 
-发布前同步修改 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本；标签须对应同一版本，例如 `v2.0.1-preview.1`。正式 Android 发布需要配置并长期保存发布签名密钥。
+发布前同步修改 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本；标签须对应同一版本，例如 `v2.0.1-preview.3`。正式 Android 发布需要配置并长期保存发布签名密钥。
 
 GitHub Pages 工作流保留为手动触发；Cloudflare 同步后端的部署见 [worker/README.md](worker/README.md)。API Token 使用 Cloudflare Secret 配置，不能提交到仓库。
 
