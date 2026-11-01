@@ -52,6 +52,8 @@ import {
 
 export type ThemePreference = 'system' | 'light' | 'dark';
 
+type PendingLocalSave = { payload: EncryptedVaultPayload; basePayload: EncryptedVaultPayload | null };
+
 const IDLE_AUTO_LOCK_MS = 5 * 60 * 1000; // 5 minutes inactivity auto-lock
 
 export default function App() {
@@ -145,7 +147,11 @@ export default function App() {
     useState<EncryptedVaultPayload | null>(null);
 
   const sessionGeneration = useRef(0);
-  const pendingLocalSave = useRef<{ payload: EncryptedVaultPayload; basePayload: EncryptedVaultPayload | null } | null>(null);
+  const pendingLocalSave = useRef<PendingLocalSave | null>(null);
+  const clearReplacedPendingSave = useCallback((replaced: PendingLocalSave | null) => {
+    // An older operation must never discard a newer session's failed candidate.
+    if (pendingLocalSave.current === replaced) pendingLocalSave.current = null;
+  }, []);
   const [isUpgrading, setIsUpgrading] = useState(false);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
   const [hasLegacyBackup, setHasLegacyBackup] = useState(false);
@@ -522,7 +528,9 @@ export default function App() {
       confirmOverwriteExistingLocal?: boolean;
     }) => {
       const generation = ++sessionGeneration.current;
+      const pendingAtStart = pendingLocalSave.current;
       const result = await SyncService.verifyAndCommitRecoveryPayload(params);
+      clearReplacedPendingSave(pendingAtStart);
       if (generation !== sessionGeneration.current) return;
 
       setIsDemoMode(false);
@@ -554,16 +562,20 @@ export default function App() {
         window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
       }
     },
-    []
+    [clearReplacedPendingSave]
   );
 
   // Rollback to previous local vault before recovery/overwrite
   const handleRollbackToPreviousLocalVault = useCallback(async () => {
     handleLockVault();
+    const generation = sessionGeneration.current;
+    const pendingAtStart = pendingLocalSave.current;
     let restored: EncryptedVaultPayload | null;
     try { restored = await SyncService.restoreFromRollbackBackup(); }
     catch (error) { setSyncMessage(error instanceof Error ? error.message : '回滚保存失败'); return; }
     if (!restored) return;
+    clearReplacedPendingSave(pendingAtStart);
+    if (generation !== sessionGeneration.current) return;
     setMemoryKey(null);
     setMemorySalt(null);
     setDecryptedRecords([]);
@@ -574,7 +586,7 @@ export default function App() {
     setRecoverySummary(null);
     setSyncStatus(SyncService.computeSyncStatus());
     setSyncMessage('已回退至覆盖前的原有本地加密密码库，请输入原主密码解锁');
-  }, [handleLockVault]);
+  }, [handleLockVault, clearReplacedPendingSave]);
 
   // V2 Master Password Change / Key Rotation (Preserves vaultId, generates new salt & key, re-encrypts all data)
   const handleRotateMasterPassword = useCallback(
@@ -683,16 +695,18 @@ export default function App() {
       );
 
       if (generation !== sessionGeneration.current) return;
-      const basePayload = pendingLocalSave.current ? pendingLocalSave.current.basePayload : encryptedPayload;
+      const pendingAtStart = pendingLocalSave.current;
+      const basePayload = pendingAtStart ? pendingAtStart.basePayload : encryptedPayload;
       try {
         await SyncService.saveLocalVaultAsync(nextPayload, { markDirty: true, expectedPayload: basePayload });
-        pendingLocalSave.current = null;
+        clearReplacedPendingSave(pendingAtStart);
         if (generation !== sessionGeneration.current) return;
         setEncryptedPayload(nextPayload);
         setDecryptedRecords(nextRecords);
         setCategories(effectiveCategories);
         setPersistenceWarning(null);
       } catch (err) {
+        if (generation !== sessionGeneration.current) return;
         if (err instanceof LocalVaultConflictError) throw err;
         // Keep the encrypted candidate and its original base for safe retry/export.
         pendingLocalSave.current = { payload: nextPayload, basePayload };
@@ -735,22 +749,27 @@ export default function App() {
       isDemoMode,
       demoEncryptedPayload,
       encryptedPayload,
+      clearReplacedPendingSave,
     ]
   );
 
   // Retry saving in-memory encryptedPayload to local storage after a quota/transaction warning
   const handleRetryLocalSave = useCallback(async () => {
     if (!encryptedPayload || isDemoMode) return;
+    const generation = sessionGeneration.current;
+    const pendingAtStart = pendingLocalSave.current;
     try {
       await SyncService.saveLocalVaultAsync(encryptedPayload, {
-        markDirty: true, expectedPayload: pendingLocalSave.current ? pendingLocalSave.current.basePayload : encryptedPayload,
+        markDirty: true, expectedPayload: pendingAtStart ? pendingAtStart.basePayload : encryptedPayload,
       });
-      pendingLocalSave.current = null;
+      clearReplacedPendingSave(pendingAtStart);
+      if (generation !== sessionGeneration.current) return;
       SyncService.clearPersistenceWarning();
       setPersistenceWarning(null);
       setSyncStatus(SyncService.computeSyncStatus());
       setSyncMessage('本地已加密保存 (IndexedDB 重试成功)');
     } catch (err) {
+      if (generation !== sessionGeneration.current) return;
       const warning = SyncService.getLastPersistenceWarning() ?? {
         code: 'STORAGE_WRITE_FAILED',
         message:
@@ -759,7 +778,7 @@ export default function App() {
       };
       setPersistenceWarning(warning);
     }
-  }, [encryptedPayload, isDemoMode]);
+  }, [encryptedPayload, isDemoMode, clearReplacedPendingSave]);
 
   // Create or Update a Record
   const handleSaveRecord = useCallback(
@@ -921,6 +940,7 @@ export default function App() {
       }
 
       const generation = sessionGeneration.current;
+      const pendingAtStart = pendingLocalSave.current;
       SyncService.saveSyncConfig(cfg);
       setSyncConfig(SyncService.getSyncConfig());
       setSyncStatus('syncing');
@@ -957,6 +977,7 @@ export default function App() {
         }
 
         await SyncService.commitVerifiedRemotePull(staged, cfg);
+        clearReplacedPendingSave(pendingAtStart);
         if (generation !== sessionGeneration.current) return;
         setSyncConfig(SyncService.getSyncConfig());
         setEncryptedPayload(staged.remotePayload);
@@ -986,15 +1007,17 @@ export default function App() {
         setSyncMessage(msg);
       }
     },
-    [isDemoMode, memoryKey, memorySalt, encryptedPayload]
+    [isDemoMode, memoryKey, memorySalt, encryptedPayload, clearReplacedPendingSave]
   );
 
   // Confirm applying a verified staged remote pull over local data
   const handleConfirmStagedPull = useCallback(async () => {
     if (!stagedPull) return;
     const generation = sessionGeneration.current;
+    const pendingAtStart = pendingLocalSave.current;
     try { await SyncService.commitVerifiedRemotePull(stagedPull, syncConfig); }
     catch (error) { setSyncMessage(error instanceof Error ? error.message : '本地版本已更新，请重新拉取'); return; }
+    clearReplacedPendingSave(pendingAtStart);
     if (generation !== sessionGeneration.current) return;
     setSyncConfig(SyncService.getSyncConfig());
     setEncryptedPayload(stagedPull.remotePayload);
@@ -1009,7 +1032,7 @@ export default function App() {
     setSyncMessage(
       `已确认并用远端版本 #${stagedPull.remoteRevision} 更新本地密码库（原数据已生成回滚备份）`
     );
-  }, [stagedPull, syncConfig]);
+  }, [stagedPull, syncConfig, clearReplacedPendingSave]);
 
   // Cancel staged pull and keep existing local vault intact
   const handleCancelStagedPull = useCallback(() => {
@@ -1025,6 +1048,7 @@ export default function App() {
       remotePassword?: string
     ) => {
       const generation = sessionGeneration.current;
+      const pendingAtStart = pendingLocalSave.current;
       const res = await SyncService.resolveConflict({
         resolution,
         config: syncConfig,
@@ -1033,6 +1057,8 @@ export default function App() {
         currentMemorySalt: memorySalt,
       });
 
+      if (res.stagedCloud) clearReplacedPendingSave(pendingAtStart);
+      if (generation !== sessionGeneration.current) return;
       setSyncConfig(SyncService.getSyncConfig());
       setSyncStatus(res.status);
       setSyncMessage(res.message);
@@ -1049,13 +1075,14 @@ export default function App() {
         setCategories(res.stagedCloud.decryptedCategories);
       }
     },
-    [syncConfig, memoryKey, memorySalt]
+    [syncConfig, memoryKey, memorySalt, clearReplacedPendingSave]
   );
 
   // Restore Historical Cloud Snapshot (`GET /api/vault/history/:revision`)
   const handleRestoreHistorySnapshot = useCallback(
     async (revision: number, snapshotPassword?: string) => {
       const generation = sessionGeneration.current;
+      const pendingAtStart = pendingLocalSave.current;
       const restored = await SyncService.restoreCloudHistorySnapshot({
         revision,
         config: syncConfig,
@@ -1064,6 +1091,7 @@ export default function App() {
         currentMemorySalt: memorySalt,
       });
 
+      clearReplacedPendingSave(pendingAtStart);
       if (generation !== sessionGeneration.current) return;
       setEncryptedPayload(restored.payload);
       setMemoryKey(restored.key);
@@ -1083,7 +1111,7 @@ export default function App() {
         }`
       );
     },
-    [syncConfig, memoryKey, memorySalt]
+    [syncConfig, memoryKey, memorySalt, clearReplacedPendingSave]
   );
 
   const handleUpgradeVault = useCallback(async () => {

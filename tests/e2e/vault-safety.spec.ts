@@ -178,3 +178,83 @@ test('simultaneous edits are serialized safely even without Web Locks', async ({
   expect(['concurrent writer A', 'concurrent writer B']).toContain(unlocked.records[0].title);
   expect(unlocked.records).toHaveLength(1);
 });
+
+test('successful recovery supersedes an older failed-save candidate across the next lock and unlock', async ({ page }) => {
+  await createVault(page);
+  await abortWrites(page, true);
+  await addRecord(page, 'superseded failed draft');
+  await expect(page.getByTestId('persistence-warning-banner')).toBeVisible();
+  await page.getByRole('button', { name: '立即锁定密码库', exact: true }).click();
+  await abortWrites(page, false);
+  await page.getByTestId('auth-mode-restore-file').click();
+  await page.getByTestId('file-restore-textarea').fill(JSON.stringify(fixture));
+  await page.getByTestId('file-restore-parse-btn').click();
+  await page.getByTestId('file-restore-confirm-overwrite-checkbox').check();
+  await page.getByTestId('file-restore-password-input').fill('LegacyFixture#2026!');
+  await page.getByTestId('file-restore-commit-btn').click();
+  await expect(page.getByText('旧版中文账号', { exact: true }).first()).toBeVisible();
+  await page.getByRole('button', { name: '立即锁定密码库', exact: true }).click();
+  await unlock(page, 'LegacyFixture#2026!');
+  await expect(page.getByText('旧版中文账号', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('superseded failed draft', { exact: true })).toHaveCount(0);
+  await addRecord(page, 'saved after recovery');
+  await expect(page.getByTestId('persistence-warning-banner')).toHaveCount(0);
+  expect((await storedPayload(page)).vaultId).toBe(fixture.vaultId);
+});
+
+test('a pending save that fails after lock cannot repopulate a newly unlocked session', async ({ page }) => {
+  await createVault(page);
+  await page.evaluate(() => {
+    const state = window as unknown as { __writeHeld?: boolean; __releaseFailedSave?: boolean };
+    const original = IDBDatabase.prototype.transaction;
+    let holdNextWrite = true;
+    IDBDatabase.prototype.transaction = function (...args: Parameters<typeof original>) {
+      const transaction = original.apply(this, args);
+      if (holdNextWrite && args[1] === 'readwrite') {
+        holdNextWrite = false;
+        state.__writeHeld = true;
+        const store = transaction.objectStore('sync_state_store');
+        // Keep the transaction pending until the test releases its failure.
+        const keepAlive = () => {
+          const request = store.get('storage_meta');
+          request.onsuccess = () => {
+            if (state.__releaseFailedSave) {
+              state.__writeHeld = false;
+              transaction.abort();
+            } else keepAlive();
+          };
+        };
+        keepAlive();
+      }
+      return transaction;
+    };
+  });
+  await page.getByRole('button', { name: '新建密码或银行卡', exact: true }).click();
+  await page.locator('#record-title-input').fill('late failed draft');
+  await page.locator('#record-category-select').selectOption('work');
+  await page.getByPlaceholder('user@example.com', { exact: true }).fill('synthetic@example.invalid');
+  await page.getByPlaceholder('输入或使用右侧生成器生成高强度密码...').fill('Synthetic-pending-secret!');
+  await page.getByRole('button', { name: '加密并保存记录', exact: true }).click();
+  await page.waitForFunction(() => (window as unknown as { __writeHeld?: boolean }).__writeHeld === true);
+  await page.keyboard.press('Alt+l');
+  await expect(page.getByRole('button', { name: '解锁密码库', exact: true })).toBeVisible();
+  await unlock(page);
+  // An old form's async completion must not close the new session's form either.
+  await page.getByRole('button', { name: '新建密码或银行卡', exact: true }).click();
+  await page.locator('#record-title-input').fill('new session write');
+  await page.locator('#record-category-select').selectOption('work');
+  await page.getByPlaceholder('user@example.com', { exact: true }).fill('synthetic@example.invalid');
+  await page.getByPlaceholder('输入或使用右侧生成器生成高强度密码...').fill('Synthetic-new-session-secret!');
+  await page.evaluate(() => { (window as unknown as { __releaseFailedSave?: boolean }).__releaseFailedSave = true; });
+  await page.waitForFunction(async () => {
+    const state = window as unknown as { __writeHeld?: boolean };
+    const locks = await navigator.locks.query();
+    return state.__writeHeld === false && [...locks.held!, ...locks.pending!].every((lock) => lock.name !== 'aegis-vault-write');
+  });
+  await expect(page.locator('[data-testid^="record-item-"]')).toHaveCount(0);
+  await expect(page.getByTestId('persistence-warning-banner')).toHaveCount(0);
+  await expect(page.locator('#record-title-input')).toHaveValue('new session write');
+  await page.getByRole('button', { name: '加密并保存记录', exact: true }).click();
+  await expect(page.locator('#record-form-modal-title')).toHaveCount(0);
+  await expect(page.locator('[data-testid^="record-item-"]')).toHaveCount(1);
+});

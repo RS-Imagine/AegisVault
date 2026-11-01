@@ -92,6 +92,11 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const initializedRecord = useRef<string | null>(null);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   useEffect(() => {
     if (!isOpen) {
@@ -287,7 +292,7 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
           },
           editingRecord?.id
         );
-        onClose();
+        if (mounted.current) onClose();
       } catch (err) {
         setErrorMsg(err instanceof Error ? err.message : '加密并保存支付卡失败');
       } finally {
@@ -318,7 +323,7 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
         },
         editingRecord?.id
       );
-      onClose();
+      if (mounted.current) onClose();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '加密并保存记录失败');
     } finally {
