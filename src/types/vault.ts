@@ -80,13 +80,15 @@ export interface DecryptedVaultMetadata {
 }
 
 /**
- * AegisVault V2 Zero-Knowledge Encrypted Vault Envelope
- * - Strictly formatVersion === 2
+ * V2/V3 encrypted vault envelope. Runtime validation requires snapshotSequence
+ * and integrity for V3 and forbids them on V2.
  * - Independent CSPRNG `vaultId` preserved across Master Password rotations
  * - `verifier`, `encryptedMetadata`, and `encryptedRecords` bound via AES-GCM AAD
  */
 export interface EncryptedVaultPayload {
-  formatVersion: 2;
+  formatVersion: 2 | 3;
+  snapshotSequence?: number;
+  integrity?: EncryptedBlob;
   vaultId: string;
   createdAt: string;
   updatedAt: string;
@@ -207,7 +209,7 @@ export interface WorkerConnectivityProbeResult {
 }
 
 export interface RemoteVaultProbeMetadata {
-  version: 2;
+  version: 2 | 3;
   vaultId: string;
   revision: number;
   saltFingerprint: string;
@@ -237,6 +239,7 @@ export interface RemoteVaultProbeResult {
 }
 
 export interface StagedRemotePullResult {
+  localBasePayload: EncryptedVaultPayload | null;
   remotePayload: EncryptedVaultPayload;
   remoteRevision: number;
   derivedKey: CryptoKey;

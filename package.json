@@ -1,20 +1,21 @@
 {
   "name": "aegis-vault",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "tsx --test src/crypto/cryptoEngine.test.ts src/security/securityRegression.test.ts",
+    "test": "tsx --test src/crypto/cryptoEngine.test.ts src/security/securityRegression.test.ts src/security/vaultV3.test.ts",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "portable:win": "tauri build --no-bundle",
     "android:init": "npm run build && cap add android && cap sync android && npm run android:prepare",
     "android:sync": "npm run build && cap sync android && npm run android:prepare",
     "native:icons": "tauri icon public/pwa-512x512.png",
-    "android:prepare": "npm run native:icons && node scripts/prepare-android.mjs"
+    "android:prepare": "npm run native:icons && node scripts/prepare-android.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@capacitor/android": "7.6.10",
@@ -27,15 +28,17 @@
   },
   "devDependencies": {
     "@capacitor/cli": "7.6.10",
+    "@playwright/test": "1.64.1",
+    "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "2.12.4",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "fake-indexeddb": "6.2.7",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@tailwindcss/vite": "^4.3.3",
-    "@vitejs/plugin-react": "^6.1.1",
     "vite": "^8.3.0"
   },
   "engines": {

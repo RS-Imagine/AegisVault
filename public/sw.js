@@ -128,7 +128,16 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       (async () => {
         const cache = await caches.open(CACHE_NAME);
-        const cached = await cache.match(request, { ignoreSearch: false });
+        // The public shell can be fetched with different CORS request modes
+        // during precache and normal navigation (some hosts add Vary: Origin).
+        // Ignore that variance only for our explicit, public precache manifest.
+        const isPrecached = PRECACHE_ASSETS.some(
+          (asset) => new URL(asset, self.registration.scope).href === url.href
+        );
+        const cached = await cache.match(request, {
+          ignoreSearch: false,
+          ignoreVary: isPrecached,
+        });
         if (cached) {
           return cached;
         }

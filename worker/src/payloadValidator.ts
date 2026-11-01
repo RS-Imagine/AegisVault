@@ -76,7 +76,7 @@ export function validateV2VaultPayload(
     }
   }
 
-  if (obj.formatVersion !== VAULT_FORMAT_VERSION) {
+  if (obj.formatVersion !== 2 && obj.formatVersion !== 3) {
     return {
       valid: false,
       reason: `Unsupported vault formatVersion (expected ${VAULT_FORMAT_VERSION})`,
@@ -129,6 +129,15 @@ export function validateV2VaultPayload(
     return { valid: false, reason: 'Unsupported cipher configuration (expected AES-256-GCM with 12-byte IV)' };
   }
 
+  if (obj.formatVersion === 3) {
+    if (!Number.isSafeInteger(obj.snapshotSequence) || Number(obj.snapshotSequence) < 1 ||
+        !isValidEncryptedBlob(obj.integrity, 17)) {
+      return { valid: false, reason: 'V3 requires an authenticated snapshot sequence and integrity blob' };
+    }
+  } else if ('integrity' in obj || 'snapshotSequence' in obj) {
+    return { valid: false, reason: 'V2 cannot contain V3 authentication fields' };
+  }
+
   if (!isValidEncryptedBlob(obj.verifier, 24)) {
     return { valid: false, reason: 'Invalid verifier encrypted blob' };
   }
@@ -144,6 +153,7 @@ export function validateV2VaultPayload(
     return { valid: false, reason: 'Too many encrypted records in vault' };
   }
 
+  const seenIds = new Set<string>();
   for (let i = 0; i < obj.encryptedRecords.length; i++) {
     const rec = obj.encryptedRecords[i];
     if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
@@ -153,6 +163,8 @@ export function validateV2VaultPayload(
     if (typeof r.id !== 'string' || r.id.trim().length === 0 || r.id.length > 128) {
       return { valid: false, reason: `encryptedRecords[${i}].id is invalid` };
     }
+    if (seenIds.has(r.id as string)) return { valid: false, reason: 'Duplicate record ID' };
+    seenIds.add(r.id as string);
     if (!['login', 'card', 'identity', 'note'].includes(String(r.recordType))) {
       return { valid: false, reason: `encryptedRecords[${i}].recordType is invalid` };
     }

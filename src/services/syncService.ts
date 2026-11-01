@@ -1,3 +1,4 @@
+import { canonicalJson } from '../../shared/vaultEnvelopeSchema';
 import {
   CloudConflictInfo,
   CloudflareSyncConfig,
@@ -15,6 +16,7 @@ import {
   WorkerConnectivityProbeResult,
 } from '../types/vault';
 import {
+  buildEncryptedVaultPayload,
   generateVaultId,
   unlockEncryptedVaultPayload,
   validateV2VaultEnvelopeStructure,
@@ -29,7 +31,7 @@ export const OBSOLETE_V1_STORAGE_KEYS = [
   'aegis_zk_categories_v1',
 ] as const;
 
-// V2 Storage Keys
+// Existing storage keys are retained for V2-to-V3 migration.
 export const VAULT_STORAGE_KEY = 'aegis_zk_vault_v2';
 export const VAULT_ROLLBACK_BACKUP_KEY = 'aegis_zk_pre_restore_backup_v2';
 export const SYNC_STATE_STORAGE_KEY = 'aegis_zk_sync_state_v2';
@@ -55,6 +57,38 @@ const IDB_STORE_VAULT = 'vault_store';
 const IDB_STORE_SYNC = 'sync_state_store';
 const CROSS_TAB_CHANNEL_NAME = 'aegis_vault_v2_channel';
 const TAB_INSTANCE_ID = globalThis.crypto.randomUUID();
+const checkpointCache = new Map<string, number>();
+const remoteCheckpointCache = new Map<string, number>();
+let localWriteQueue: Promise<unknown> = Promise.resolve();
+
+export class LocalVaultConflictError extends Error {
+  constructor() { super('本地密码库已被另一个操作更新，已阻止覆盖。请保留当前草稿，重新打开记录后合并保存。'); this.name = 'LocalVaultConflictError'; }
+}
+
+function withVaultWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+  const run = () => typeof navigator !== 'undefined' && navigator.locks
+    ? navigator.locks.request('aegis-vault-write', operation) : operation();
+  const result = localWriteQueue.catch(() => undefined).then(run);
+  localWriteQueue = result.catch(() => undefined);
+  return result;
+}
+
+function samePayload(a: EncryptedVaultPayload | null, b: EncryptedVaultPayload | null): boolean {
+  return canonicalJson(a) === canonicalJson(b);
+}
+
+export interface LocalVaultSaveOptions {
+  markDirty?: boolean;
+  syncedRevision?: number;
+  pendingPasswordRotationPurge?: boolean;
+  expectedPayload?: EncryptedVaultPayload | null;
+  rollbackBackup?: EncryptedVaultPayload | null;
+  legacyBackup?: EncryptedVaultPayload;
+  allowHistoricalRestore?: boolean;
+  trustedRemoteSequence?: number;
+  fromVerifiedRemote?: boolean;
+}
+
 
 interface StorageMetaState {
   writeSequence: number;
@@ -66,12 +100,22 @@ export interface AtomicIdbSnapshot {
   vault: EncryptedVaultPayload | null;
   syncState: LocalSyncStateV2 | null;
   rollbackBackup?: EncryptedVaultPayload | null;
+  checkpoints?: Record<string, number>;
+  remoteCheckpoints?: Record<string, number>;
+  legacyBackup?: EncryptedVaultPayload | null;
   meta: StorageMetaState;
+}
+
+export interface VaultSnapshotExpectation {
+  payload: EncryptedVaultPayload | null;
+  resetEpoch: number;
+  writeSequence?: number;
+  fromRemote?: boolean;
 }
 
 export interface PluggableIdbAdapter {
   readSnapshot(): Promise<AtomicIdbSnapshot | null>;
-  writeSnapshotAtomically(snapshot: AtomicIdbSnapshot): Promise<void>;
+  writeSnapshotAtomically(snapshot: AtomicIdbSnapshot, expected?: VaultSnapshotExpectation): Promise<void>;
   clearVaultAtomically(meta: StorageMetaState): Promise<void>;
 }
 
@@ -81,6 +125,8 @@ let runtimeApiTokenMemory = '';
 // Monotonic write sequence and reset epoch in memory
 let memoryWriteSequence = 0;
 let memoryResetEpoch = 0;
+let committedSnapshot: AtomicIdbSnapshot | null = null;
+let mirrorUnavailable = false;
 let lastPersistenceWarning: LocalStoragePersistenceWarning | null = null;
 let pendingIdbWritePromise: Promise<void> = Promise.resolve();
 let inFlightPushQueue: Promise<unknown> = Promise.resolve();
@@ -229,6 +275,9 @@ const nativeBrowserIdbAdapter: PluggableIdbAdapter = {
         const backupReq = vaultStore.get('rollback_backup');
         const syncReq = syncStore.get('primary');
         const metaReq = syncStore.get('storage_meta');
+        const checkpointsReq = syncStore.get('verified_checkpoints');
+        const legacyReq = vaultStore.get('legacy_v2_backup');
+        const remoteCheckpointsReq = syncStore.get('verified_remote_checkpoints');
 
         tx.oncomplete = () => {
           const rawMeta = (metaReq.result as Partial<StorageMetaState>) ?? {};
@@ -237,6 +286,9 @@ const nativeBrowserIdbAdapter: PluggableIdbAdapter = {
             syncState: (syncReq.result as LocalSyncStateV2) ?? null,
             rollbackBackup:
               (backupReq.result as EncryptedVaultPayload) ?? null,
+            checkpoints: checkpointsReq.result ?? {},
+            remoteCheckpoints: remoteCheckpointsReq.result ?? {},
+            legacyBackup: legacyReq.result ?? null,
             meta: {
               writeSequence:
                 typeof rawMeta.writeSequence === 'number'
@@ -266,89 +318,74 @@ const nativeBrowserIdbAdapter: PluggableIdbAdapter = {
     });
   },
 
-  async writeSnapshotAtomically(snapshot: AtomicIdbSnapshot): Promise<void> {
+  async writeSnapshotAtomically(snapshot: AtomicIdbSnapshot, expected?: VaultSnapshotExpectation): Promise<void> {
     const db = await openVaultIndexedDB();
-    if (!db) return;
+    if (!db) {
+      if (typeof document !== 'undefined') throw new Error('IndexedDB 不可用，无法确认密码库已保存');
+      return; // Node integration tests use the simulated browser or an injected adapter.
+    }
     return new Promise((resolve, reject) => {
+      let failure: Error | null = null;
       try {
-        const tx = db.transaction(
-          [IDB_STORE_VAULT, IDB_STORE_SYNC],
-          'readwrite'
-        );
+        const tx = db.transaction([IDB_STORE_VAULT, IDB_STORE_SYNC], 'readwrite');
         const vaultStore = tx.objectStore(IDB_STORE_VAULT);
         const syncStore = tx.objectStore(IDB_STORE_SYNC);
-
-        // Guard against out-of-order stale async writes or writes from before a vault reset
-        const existingMetaReq = syncStore.get('storage_meta');
-        existingMetaReq.onsuccess = () => {
-          const existingMeta =
-            (existingMetaReq.result as Partial<StorageMetaState>) ?? {};
-          const existingResetEpoch =
-            typeof existingMeta.resetEpoch === 'number'
-              ? existingMeta.resetEpoch
-              : 0;
-          const existingWriteSeq =
-            typeof existingMeta.writeSequence === 'number'
-              ? existingMeta.writeSequence
-              : 0;
-
-          if (
-            snapshot.meta.resetEpoch < existingResetEpoch ||
-            snapshot.meta. resetEpoch < memoryResetEpoch
-          ) {
-            // Stale write from before a reset: abort silently without overwriting
-            return;
-          }
-          if (
-            snapshot.meta.resetEpoch === existingResetEpoch &&
-            snapshot.meta.writeSequence < existingWriteSeq
-          ) {
-            // Out-of-order older write sequence: skip so newer state is preserved
-            return;
-          }
-
-          if (snapshot.vault) {
-            vaultStore.put(snapshot.vault, 'primary');
-          } else {
-            vaultStore.delete('primary');
-          }
-
-          if (snapshot.rollbackBackup !== undefined) {
-            if (snapshot.rollbackBackup) {
-              vaultStore.put(snapshot.rollbackBackup, 'rollback_backup');
-            } else {
-              vaultStore.delete('rollback_backup');
+        const metaReq = syncStore.get('storage_meta');
+        const currentReq = vaultStore.get('primary');
+        const remoteCheckpointsReq = syncStore.get('verified_remote_checkpoints');
+        const checkpointsReq = syncStore.get('verified_checkpoints');
+        // IDB requests run in issue order; no await crosses this transaction.
+        checkpointsReq.onsuccess = () => {
+          try {
+            const meta = metaReq.result ?? { resetEpoch: 0, writeSequence: 0 };
+            const current = currentReq.result ?? null;
+            if (expected && (!samePayload(current, expected.payload) || meta.resetEpoch !== expected.resetEpoch ||
+                (expected.writeSequence !== undefined && meta.writeSequence !== expected.writeSequence))) {
+              failure = new LocalVaultConflictError();
+              tx.abort();
+              return;
             }
-          }
-
-          if (snapshot.syncState) {
-            syncStore.put(snapshot.syncState, 'primary');
-          } else {
-            syncStore.delete('primary');
-          }
-
-          syncStore.put(snapshot.meta, 'storage_meta');
+            const remoteFloor = snapshot.vault ? remoteCheckpointsReq.result?.[snapshot.vault.vaultId] ?? 0 : 0;
+            if (expected?.fromRemote && remoteFloor && snapshot.vault &&
+                (snapshot.vault.formatVersion !== 3 || snapshot.vault.snapshotSequence! < remoteFloor)) {
+              failure = new Error('检测到旧快照或格式降级，已阻止覆盖本机已验证版本');
+              tx.abort();
+              return;
+            }
+            if (snapshot.meta.resetEpoch < Math.max(meta.resetEpoch, memoryResetEpoch) ||
+                (snapshot.meta.resetEpoch === meta.resetEpoch && snapshot.meta.writeSequence < meta.writeSequence)) {
+              failure = new LocalVaultConflictError();
+              tx.abort();
+              return;
+            }
+            if (snapshot.vault) vaultStore.put(snapshot.vault, 'primary');
+            else vaultStore.delete('primary');
+            for (const [key, value] of [['rollback_backup', snapshot.rollbackBackup], ['legacy_v2_backup', snapshot.legacyBackup]] as const) {
+              if (value !== undefined) {
+                if (value) vaultStore.put(value, key);
+                else vaultStore.delete(key);
+              }
+            }
+            if (snapshot.syncState) syncStore.put(snapshot.syncState, 'primary');
+            else syncStore.delete('primary');
+            syncStore.put(snapshot.meta, 'storage_meta');
+            if (snapshot.checkpoints) {
+              const checkpoints = { ...(checkpointsReq.result ?? {}) };
+              for (const [id, sequence] of Object.entries(snapshot.checkpoints)) {
+                checkpoints[id] = Math.max(checkpoints[id] ?? 0, sequence);
+              }
+              syncStore.put(checkpoints, 'verified_checkpoints');
+            }
+            if (snapshot.remoteCheckpoints) {
+              const checkpoints = { ...(remoteCheckpointsReq.result ?? {}) };
+              for (const [id, value] of Object.entries(snapshot.remoteCheckpoints)) checkpoints[id] = Math.max(checkpoints[id] ?? 0, value);
+              syncStore.put(checkpoints, 'verified_remote_checkpoints');
+            }
+          } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); tx.abort(); }
         };
-
-        // CRITICAL: Only resolve after tx.oncomplete fires!
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          const err = tx.error || new Error('IndexedDB 事务写入失败');
-          db.close();
-          reject(err);
-        };
-        tx.onabort = () => {
-          const err = tx.error || new Error('IndexedDB 事务被中止');
-          db.close();
-          reject(err);
-        };
-      } catch (err) {
-        db.close();
-        reject(err);
-      }
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = tx.onabort = () => { db.close(); reject(failure ?? tx.error ?? new Error('IndexedDB 事务提交失败')); };
+      } catch (error) { db.close(); reject(error); }
     });
   },
 
@@ -561,6 +598,7 @@ export function hasEncryptedVaultDivergence(
   a: EncryptedVaultPayload,
   b: EncryptedVaultPayload
 ): boolean {
+  if (a.formatVersion === 3 || b.formatVersion === 3) return canonicalJson(a) !== canonicalJson(b);
   if (a.vaultId !== b.vaultId) return true;
   if (a.kdf.salt !== b.kdf.salt) return true;
   if (a.kdf.iterations !== b.kdf.iterations) return true;
@@ -704,6 +742,7 @@ export class SyncService {
 
   static async flushPendingPersistence(): Promise<void> {
     await pendingIdbWritePromise;
+    await localWriteQueue;
   }
 
   /**
@@ -714,185 +753,63 @@ export class SyncService {
    *    higher `lastSyncedRevision`, or newer `updatedAt` wins and is atomically synced to both.
    */
   static async hydrateFromIndexedDB(): Promise<EncryptedVaultPayload | null> {
-    purgeLegacyV1StorageKeys();
-    await pendingIdbWritePromise.catch(() => undefined);
-
-    const adapter = getActiveIdbAdapter();
-    const idbSnapshot = await adapter.readSnapshot();
-    const lsMeta = readLocalStorageMeta();
-    const lsVault = this.getLocalVault();
-    const lsSync = this.getLocalSyncState();
-
-    const idbResetEpoch = idbSnapshot?.meta.resetEpoch ?? 0;
-    const effectiveResetEpoch = Math.max(
-      memoryResetEpoch,
-      lsMeta.resetEpoch,
-      idbResetEpoch
-    );
-    memoryResetEpoch = effectiveResetEpoch;
-
-    // If IndexedDB recorded a newer reset epoch than localStorage, purge stale localStorage mirror
-    if (idbResetEpoch > lsMeta.resetEpoch && !idbSnapshot?.vault) {
-      if (typeof window !== 'undefined') {
-        window.localStorage.removeItem(VAULT_STORAGE_KEY);
-        window.localStorage.removeItem(SYNC_STATE_STORAGE_KEY);
+    return withVaultWriteLock(async () => {
+      purgeLegacyV1StorageKeys();
+      await pendingIdbWritePromise.catch(() => undefined);
+      const adapter = getActiveIdbAdapter();
+      const durable = await adapter.readSnapshot();
+      Object.entries(durable?.checkpoints ?? {}).forEach(([id, value]) => checkpointCache.set(id, Math.max(checkpointCache.get(id) ?? 0, value)));
+      Object.entries(durable?.remoteCheckpoints ?? {}).forEach(([id, value]) => remoteCheckpointCache.set(id, Math.max(remoteCheckpointCache.get(id) ?? 0, value)));
+      const lsMeta = readLocalStorageMeta();
+      const lsVault = this.getLocalVault();
+      const lsSync = this.getLocalSyncState();
+      const epoch = Math.max(memoryResetEpoch, lsMeta.resetEpoch, durable?.meta.resetEpoch ?? 0);
+      const sequence = Math.max(memoryWriteSequence, lsMeta.writeSequence, durable?.meta.writeSequence ?? 0);
+      const meta = { resetEpoch: epoch, writeSequence: sequence, updatedAt: Date.now() };
+      const idbReset = durable && !durable.vault && durable.meta.resetEpoch >= lsMeta.resetEpoch;
+      const mirrorReset = !lsVault && lsMeta.resetEpoch > (durable?.meta.resetEpoch ?? 0);
+      if (idbReset || mirrorReset) {
+        const empty: AtomicIdbSnapshot = { vault: null, syncState: null, meta, checkpoints: durable?.checkpoints };
+        if (mirrorReset) await adapter.writeSnapshotAtomically(empty, { payload: durable?.vault ?? null, resetEpoch: durable?.meta.resetEpoch ?? 0 });
+        this.mirrorCommittedSnapshot(empty);
+        return null;
       }
-      writeLocalStorageMeta({
-        writeSequence: Math.max(
-          lsMeta.writeSequence,
-          idbSnapshot?.meta.writeSequence ?? 0
-        ),
-        resetEpoch: effectiveResetEpoch,
-        updatedAt: Date.now(),
-      });
-      return null;
-    }
+      const idbVault = durable?.vault && validateV2VaultEnvelopeStructure(durable.vault).valid ? durable.vault : null;
+      // New V3 writes commit IDB first. A mirror can never overrule committed V3.
+      // Sequence reconciliation remains only for migration from mirror-first V2.
+      const idbWins = idbVault && (idbVault.formatVersion === 3 || !lsVault ||
+        durable!.meta.writeSequence > lsMeta.writeSequence ||
+        (durable!.meta.writeSequence === lsMeta.writeSequence &&
+          (durable!.syncState?.lastSyncedRevision ?? 0) >= lsSync.lastSyncedRevision));
+      const vault = idbWins ? idbVault : lsVault;
+      if (!vault) return null;
+      const syncState = idbWins ? durable!.syncState ?? lsSync : lsSync;
+      const snapshot: AtomicIdbSnapshot = { vault, syncState, meta, rollbackBackup: durable?.rollbackBackup,
+        legacyBackup: durable?.legacyBackup, checkpoints: durable?.checkpoints };
+      if (!idbWins) await adapter.writeSnapshotAtomically(snapshot, { payload: durable?.vault ?? null, resetEpoch: durable?.meta.resetEpoch ?? 0 });
+      this.mirrorCommittedSnapshot(snapshot);
+      return vault;
+    });
+  }
 
-    // If localStorage recorded a newer reset epoch than IndexedDB (e.g. reset right before reload), clear IndexedDB
-    if (lsMeta.resetEpoch > idbResetEpoch && !lsVault) {
-      const nextMeta: StorageMetaState = {
-        writeSequence: Math.max(
-          lsMeta.writeSequence,
-          idbSnapshot?.meta.writeSequence ?? 0
-        ),
-        resetEpoch: effectiveResetEpoch,
-        updatedAt: Date.now(),
-      };
-      writeLocalStorageMeta(nextMeta);
-      await adapter.clearVaultAtomically(nextMeta).catch(() => undefined);
-      return null;
-    }
-
-    let validIdbVault: EncryptedVaultPayload | null = null;
-    if (idbSnapshot?.vault) {
-      const check = validateV2VaultEnvelopeStructure(idbSnapshot.vault);
-      if (check.valid && check.payload) {
-        validIdbVault = check.payload;
-      }
-    }
-
-    const idbWriteSeq =
-      idbSnapshot?.meta.writeSequence ??
-      idbSnapshot?.syncState?.writeSequence ??
-      0;
-    const lsWriteSeq = lsMeta.writeSequence || lsSync.writeSequence || 0;
-    memoryWriteSequence = Math.max(memoryWriteSequence, idbWriteSeq, lsWriteSeq);
-
-    // Case A: Both IndexedDB and localStorage have valid vaults -> reconcile deterministically
-    if (validIdbVault && lsVault) {
-      const idbRev = idbSnapshot?.syncState?.lastSyncedRevision ?? 0;
-      const lsRev = lsSync.lastSyncedRevision ?? 0;
-      const idbTime = new Date(validIdbVault.updatedAt).getTime() || 0;
-      const lsTime = new Date(lsVault.updatedAt).getTime() || 0;
-
-      // Prefer the record with strictly newer writeSequence, or newer revision, or newer timestamp.
-      // When equal, IndexedDB is authoritative.
-      const idbWins =
-        idbWriteSeq > lsWriteSeq ||
-        (idbWriteSeq === lsWriteSeq && idbRev > lsRev) ||
-        (idbWriteSeq === lsWriteSeq && idbRev === lsRev && idbTime >= lsTime);
-
-      const winningVault = idbWins ? validIdbVault : lsVault;
-      const winningSync: LocalSyncStateV2 = idbWins
-        ? {
-            ...lsSync,
-            ...(idbSnapshot?.syncState ?? {}),
-            vaultId: winningVault.vaultId,
-            writeSequence: memoryWriteSequence,
-          }
-        : {
-            ...lsSync,
-            vaultId: winningVault.vaultId,
-            writeSequence: memoryWriteSequence,
-          };
-
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(
-          VAULT_STORAGE_KEY,
-          JSON.stringify(winningVault)
-        );
-        window.localStorage.setItem(
-          SYNC_STATE_STORAGE_KEY,
-          JSON.stringify(winningSync)
-        );
-      }
-      const nextMeta: StorageMetaState = {
-        writeSequence: memoryWriteSequence,
-        resetEpoch: effectiveResetEpoch,
-        updatedAt: Date.now(),
-      };
-      writeLocalStorageMeta(nextMeta);
-      await adapter
-        .writeSnapshotAtomically({
-          vault: winningVault,
-          syncState: winningSync,
-          meta: nextMeta,
-        })
-        .catch(() => undefined);
-
-      return winningVault;
-    }
-
-    // Case B: Only IndexedDB has a valid vault (e.g. localStorage was evicted by browser)
-    if (validIdbVault && !lsVault) {
-      const restoredSync: LocalSyncStateV2 = idbSnapshot?.syncState ?? {
-        vaultId: validIdbVault.vaultId,
-        lastSyncedRevision: 0,
-        pendingMutationId: null,
-        pendingMutationPayloadHash: null,
-        writeSequence: memoryWriteSequence,
-        dirtySince: null,
-        lastSyncedAt: null,
-        conflictState: null,
-        pendingPasswordRotationPurge: false,
-      };
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(
-          VAULT_STORAGE_KEY,
-          JSON.stringify(validIdbVault)
-        );
-        window.localStorage.setItem(
-          SYNC_STATE_STORAGE_KEY,
-          JSON.stringify(restoredSync)
-        );
-      }
-      writeLocalStorageMeta({
-        writeSequence: memoryWriteSequence,
-        resetEpoch: effectiveResetEpoch,
-        updatedAt: Date.now(),
-      });
-      return validIdbVault;
-    }
-
-    // Case C: Only localStorage has a valid vault (e.g. legacy V2 data or before first IDB flush) -> migrate to IndexedDB
-    if (!validIdbVault && lsVault) {
-      const nextSeq = Math.max(1, memoryWriteSequence);
-      memoryWriteSequence = nextSeq;
-      const syncedState: LocalSyncStateV2 = {
-        ...lsSync,
-        vaultId: lsVault.vaultId,
-        writeSequence: nextSeq,
-      };
-      const nextMeta: StorageMetaState = {
-        writeSequence: nextSeq,
-        resetEpoch: effectiveResetEpoch,
-        updatedAt: Date.now(),
-      };
-      writeLocalStorageMeta(nextMeta);
-      await adapter
-        .writeSnapshotAtomically({
-          vault: lsVault,
-          syncState: syncedState,
-          meta: nextMeta,
-        })
-        .catch(() => undefined);
-      return lsVault;
-    }
-
-    return null;
+  private static mirrorCommittedSnapshot(snapshot: AtomicIdbSnapshot): void {
+    committedSnapshot = snapshot;
+    mirrorUnavailable = false;
+    memoryWriteSequence = Math.max(memoryWriteSequence, snapshot.meta.writeSequence);
+    memoryResetEpoch = Math.max(memoryResetEpoch, snapshot.meta.resetEpoch);
+    if (typeof window === 'undefined') return;
+    try {
+      if (snapshot.vault) window.localStorage.setItem(VAULT_STORAGE_KEY, JSON.stringify(snapshot.vault));
+      else window.localStorage.removeItem(VAULT_STORAGE_KEY);
+      if (snapshot.syncState) window.localStorage.setItem(SYNC_STATE_STORAGE_KEY, JSON.stringify(snapshot.syncState));
+      else window.localStorage.removeItem(SYNC_STATE_STORAGE_KEY);
+      if (snapshot.rollbackBackup) window.localStorage.setItem(VAULT_ROLLBACK_BACKUP_KEY, JSON.stringify(snapshot.rollbackBackup));
+      writeLocalStorageMeta(snapshot.meta);
+    } catch { mirrorUnavailable = true; }
   }
 
   static getLocalVault(): EncryptedVaultPayload | null {
+    if (mirrorUnavailable && committedSnapshot) return committedSnapshot.vault;
     if (typeof window === 'undefined') return null;
     purgeLegacyV1StorageKeys();
     const raw = window.localStorage.getItem(VAULT_STORAGE_KEY);
@@ -908,6 +825,7 @@ export class SyncService {
   }
 
   static getLocalSyncState(): LocalSyncStateV2 {
+    if (mirrorUnavailable && committedSnapshot?.syncState) return committedSnapshot.syncState;
     const localVault = this.getLocalVault();
     const defaultVaultId = localVault?.vaultId || '';
     if (typeof window === 'undefined') {
@@ -1030,7 +948,7 @@ export class SyncService {
           vault: currentVault,
           syncState: enrichedState,
           meta: nextMeta,
-        })
+        }, { payload: currentVault, resetEpoch: meta.resetEpoch })
       )
       .catch(() => undefined);
 
@@ -1074,168 +992,115 @@ export class SyncService {
   }
 
   /**
-   * Synchronous local vault save that updates the localStorage mirror immediately
-   * and queues an atomic single-transaction IndexedDB commit (`vault_store` + `sync_state_store`).
-   * For callers that want to await `tx.oncomplete` and verify IndexedDB durability, use `saveLocalVaultAsync`.
+   * Atomic, awaited local save. Browser mutations pass the snapshot they edited
+   * as expectedPayload; IndexedDB commits vault, sync state and backups together
+   * before the localStorage mirror or cross-tab notification is updated.
    */
-  static saveLocalVault(
-    payload: EncryptedVaultPayload,
-    options: {
-      markDirty?: boolean;
-      syncedRevision?: number;
-      pendingPasswordRotationPurge?: boolean;
-    } = {}
-  ): void {
-    if (typeof window === 'undefined') return;
-    if (simulatedPersistenceFailureForTests) {
-      const warning: LocalStoragePersistenceWarning = {
-        code: simulatedPersistenceFailureForTests.code,
-        message: simulatedPersistenceFailureForTests.message,
-        occurredAt: Date.now(),
-      };
-      lastPersistenceWarning = warning;
-      throw new Error(warning.message);
-    }
+  static async saveLocalVault(payload: EncryptedVaultPayload, options: LocalVaultSaveOptions = {}): Promise<{ writeSequence: number }> {
+    return this.saveLocalVaultAsync(payload, options);
+  }
 
-    const validation = validateV2VaultEnvelopeStructure(payload);
-    if (!validation.valid || !validation.payload) {
-      throw new Error(
-        `拒绝写入非法的 V2 密码库结构：${validation.reason || '结构校验未通过'}`
-      );
-    }
-
-    const serialized = JSON.stringify(validation.payload);
-    const byteLength = new TextEncoder().encode(serialized).byteLength;
-    if (byteLength > MAX_VAULT_PAYLOAD_BYTES) {
-      throw new Error('加密密码库体积超过 1MB 安全上限，拒绝写入');
-    }
-
-    const currentSync = this.getLocalSyncState();
-    const meta = readLocalStorageMeta();
-    const nextSeq = meta.writeSequence + 1;
-    const markDirty = options.markDirty ?? true;
-    const payloadHash = computePayloadContentSignature(validation.payload);
-
-    // Bind pendingMutationId to the exact payload hash:
-    // - If payload is identical to the pending snapshot, preserve the same mutationId for idempotent retry.
-    // - If payload changed, generate a fresh mutationId so the new snapshot never collides with an old mutationId.
-    let nextMutationId: string | null = null;
-    let nextMutationHash: string | null = null;
-    if (markDirty) {
-      if (
-        currentSync.pendingMutationId &&
-        currentSync.pendingMutationPayloadHash === payloadHash
-      ) {
-        nextMutationId = currentSync.pendingMutationId;
-      } else {
-        nextMutationId = generateVaultId();
+  static async saveLocalVaultAsync(payload: EncryptedVaultPayload, options: LocalVaultSaveOptions = {}): Promise<{ writeSequence: number }> {
+    // Freeze the candidate and caller's base before waiting for another writer.
+    const candidate = structuredClone(payload);
+    const expected = options.expectedPayload === undefined ? undefined : structuredClone(options.expectedPayload);
+    return withVaultWriteLock(async () => {
+      await pendingIdbWritePromise.catch(() => undefined);
+      if (simulatedPersistenceFailureForTests) {
+        lastPersistenceWarning = { ...simulatedPersistenceFailureForTests, occurredAt: Date.now() };
+        throw new Error(lastPersistenceWarning.message);
       }
-      nextMutationHash = payloadHash;
-    }
-
-    const updatedSync: LocalSyncStateV2 = {
-      vaultId: validation.payload.vaultId,
-      lastSyncedRevision:
-        typeof options.syncedRevision === 'number'
-          ? options.syncedRevision
-          : currentSync.vaultId === validation.payload.vaultId
-          ? currentSync.lastSyncedRevision
-          : 0,
-      pendingMutationId: nextMutationId,
-      pendingMutationPayloadHash: nextMutationHash,
-      writeSequence: nextSeq,
-      dirtySince: markDirty ? currentSync.dirtySince || Date.now() : null,
-      lastSyncedAt: !markDirty ? Date.now() : currentSync.lastSyncedAt,
-      conflictState: !markDirty ? null : currentSync.conflictState,
-      pendingPasswordRotationPurge:
-        options.pendingPasswordRotationPurge !== undefined
-          ? options.pendingPasswordRotationPurge
-          : currentSync.pendingPasswordRotationPurge,
-    };
-
-    const nextMeta: StorageMetaState = {
-      writeSequence: nextSeq,
-      resetEpoch: meta.resetEpoch,
-      updatedAt: Date.now(),
-    };
-
-    try {
-      window.localStorage.setItem(VAULT_STORAGE_KEY, serialized);
-      window.localStorage.setItem(
-        SYNC_STATE_STORAGE_KEY,
-        JSON.stringify(updatedSync)
-      );
-      writeLocalStorageMeta(nextMeta);
-      lastPersistenceWarning = null;
-    } catch (err) {
-      const isQuota =
-        err instanceof Error &&
-        (err.name === 'QuotaExceededError' ||
-          err.message.toLowerCase().includes('quota'));
-      const warning: LocalStoragePersistenceWarning = {
-        code: isQuota ? 'QUOTA_EXCEEDED' : 'STORAGE_WRITE_FAILED',
-        message: isQuota
-          ? '浏览器本地存储空间已满 (QuotaExceededError)，当前修改仍保留在内存中，请立即导出加密备份'
-          : '写入浏览器本地存储失败，当前修改仍保留在内存中，请立即导出加密备份',
-        occurredAt: Date.now(),
+      const validation = validateV2VaultEnvelopeStructure(candidate);
+      if (!validation.valid) throw new Error(`拒绝写入非法密码库：${validation.reason}`);
+      if (new TextEncoder().encode(JSON.stringify(candidate)).byteLength > MAX_VAULT_PAYLOAD_BYTES) throw new Error('加密密码库体积超过 1MB 安全上限');
+      const adapter = getActiveIdbAdapter();
+      const durable = await adapter.readSnapshot();
+      const current = durable ? durable.vault : this.getLocalVault();
+      const meta = durable?.meta ?? readLocalStorageMeta();
+      if (expected !== undefined && !samePayload(current, expected)) throw new LocalVaultConflictError();
+      const currentSync = durable?.syncState ?? this.getLocalSyncState();
+      const sequence = Math.max(meta.writeSequence, readLocalStorageMeta().writeSequence) + 1;
+      const markDirty = options.markDirty ?? true;
+      const signature = computePayloadContentSignature(candidate);
+      const syncState: LocalSyncStateV2 = {
+        vaultId: candidate.vaultId,
+        lastSyncedRevision: options.syncedRevision ?? (currentSync.vaultId === candidate.vaultId ? currentSync.lastSyncedRevision : 0),
+        pendingMutationId: markDirty ? (currentSync.pendingMutationPayloadHash === signature && currentSync.pendingMutationId ? currentSync.pendingMutationId : generateVaultId()) : null,
+        pendingMutationPayloadHash: markDirty ? signature : null,
+        writeSequence: sequence,
+        dirtySince: markDirty ? currentSync.dirtySince || Date.now() : null,
+        lastSyncedAt: !markDirty ? Date.now() : currentSync.lastSyncedAt,
+        conflictState: markDirty ? currentSync.conflictState : null,
+        pendingPasswordRotationPurge: options.pendingPasswordRotationPurge ?? currentSync.pendingPasswordRotationPurge,
       };
-      lastPersistenceWarning = warning;
-      throw new Error(warning.message);
-    }
-
-    const validPayload = validation.payload;
-    const adapter = getActiveIdbAdapter();
-    pendingIdbWritePromise = pendingIdbWritePromise
-      .catch(() => undefined)
-      .then(async () => {
-        await adapter.writeSnapshotAtomically({
-          vault: validPayload,
-          syncState: updatedSync,
-          meta: nextMeta,
-        });
-      })
-      .catch((err) => {
-        const isQuota =
-          err instanceof Error &&
-          (err.name === 'QuotaExceededError' ||
-            err.message.toLowerCase().includes('quota'));
+      const remoteFloor = Math.max(durable?.remoteCheckpoints?.[candidate.vaultId] ?? 0, remoteCheckpointCache.get(candidate.vaultId) ?? 0);
+      if (options.fromVerifiedRemote && remoteFloor && (candidate.formatVersion !== 3 || candidate.snapshotSequence! < remoteFloor)) {
+        throw new Error('检测到旧快照或格式降级，已阻止覆盖本机已验证版本');
+      }
+      const checkpoints = { ...(durable?.checkpoints ?? {}) };
+      if (!options.allowHistoricalRestore && candidate.formatVersion === 3 && candidate.snapshotSequence! < (checkpoints[candidate.vaultId] ?? 0)) {
+        throw new Error('快照序号早于本机已验证版本，请使用显式历史恢复入口');
+      }
+      if (candidate.formatVersion === 3) {
+        checkpoints[candidate.vaultId] = Math.max(checkpoints[candidate.vaultId] ?? 0, candidate.snapshotSequence!);
+      }
+      const remoteCheckpoints = { ...(durable?.remoteCheckpoints ?? {}) };
+      if (options.trustedRemoteSequence) remoteCheckpoints[candidate.vaultId] = Math.max(remoteCheckpoints[candidate.vaultId] ?? 0, options.trustedRemoteSequence);
+      const snapshot: AtomicIdbSnapshot = {
+        vault: candidate, syncState, meta: { writeSequence: sequence, resetEpoch: Math.max(meta.resetEpoch, memoryResetEpoch, readLocalStorageMeta().resetEpoch), updatedAt: Date.now() },
+        checkpoints, remoteCheckpoints, rollbackBackup: options.rollbackBackup,
+        legacyBackup: options.legacyBackup,
+      };
+      try {
+        await adapter.writeSnapshotAtomically(snapshot, { payload: current, resetEpoch: meta.resetEpoch, writeSequence: durable?.meta.writeSequence, fromRemote: options.fromVerifiedRemote });
+      } catch (error) {
+        if (error instanceof LocalVaultConflictError) throw error;
+        const isQuota = error instanceof Error && (error.name === 'QuotaExceededError' || /quota/i.test(error.message));
         lastPersistenceWarning = {
           code: isQuota ? 'QUOTA_EXCEEDED' : 'IDB_TRANSACTION_FAILED',
-          message: isQuota
-            ? 'IndexedDB 存储配额不足 (QuotaExceededError)，请导出加密 JSON 备份以防数据丢失'
-            : `IndexedDB 事务提交异常 (${
-                err instanceof Error ? err.message : '未知错误'
-              })，建议立即导出加密备份`,
-          occurredAt: Date.now(),
+          message: `${error instanceof Error ? error.message : 'IndexedDB 提交失败'}；未保存修改可导出为加密备份`, occurredAt: Date.now(),
         };
-        throw err;
-      });
-
-    broadcastCrossTabUpdate({
-      type: 'VAULT_UPDATED',
-      vaultId: validation.payload.vaultId,
-      updatedAt: validation.payload.updatedAt,
-      revision: updatedSync.lastSyncedRevision,
-      writeSequence: nextSeq,
-      resetEpoch: nextMeta.resetEpoch,
+        throw error;
+      }
+      // IDB is committed. A failed mirror cannot turn an uncommitted candidate
+      // into the startup winner or roll the durable transaction back.
+      this.mirrorCommittedSnapshot(snapshot);
+      Object.entries(checkpoints).forEach(([id, value]) => checkpointCache.set(id, value));
+      Object.entries(remoteCheckpoints).forEach(([id, value]) => remoteCheckpointCache.set(id, value));
+      lastPersistenceWarning = null;
+      broadcastCrossTabUpdate({ type: 'VAULT_UPDATED', vaultId: candidate.vaultId, updatedAt: candidate.updatedAt,
+        revision: syncState.lastSyncedRevision, writeSequence: sequence, resetEpoch: snapshot.meta.resetEpoch });
+      return { writeSequence: sequence };
     });
   }
 
-  /**
-   * Awaits the full IndexedDB `tx.oncomplete` transaction before resolving.
-   * Rejects with a structured error if either localStorage or IndexedDB transaction fails or aborts.
-   */
-  static async saveLocalVaultAsync(
-    payload: EncryptedVaultPayload,
-    options: {
-      markDirty?: boolean;
-      syncedRevision?: number;
-      pendingPasswordRotationPurge?: boolean;
-    } = {}
-  ): Promise<{ writeSequence: number }> {
-    this.saveLocalVault(payload, options);
-    await pendingIdbWritePromise;
-    return { writeSequence: memoryWriteSequence };
+  static async assertSnapshotFreshness(payload: EncryptedVaultPayload): Promise<void> {
+    const durable = await getActiveIdbAdapter().readSnapshot();
+    const observed = Math.max(remoteCheckpointCache.get(payload.vaultId) ?? 0, durable?.remoteCheckpoints?.[payload.vaultId] ?? 0);
+    if (observed && (payload.formatVersion !== 3 || Number(payload.snapshotSequence) < observed)) {
+      throw new Error('检测到旧快照或格式降级：远端数据早于本设备已验证的版本，已阻止覆盖。历史恢复请使用备份或历史快照入口。');
+    }
+  }
+
+  private static async noteVerifiedRemotePayload(payload: EncryptedVaultPayload): Promise<void> {
+    if (payload.formatVersion !== 3) return;
+    await withVaultWriteLock(async () => {
+      await pendingIdbWritePromise.catch(() => undefined);
+      const adapter = getActiveIdbAdapter();
+      const durable = await adapter.readSnapshot();
+      const observed = Math.max(remoteCheckpointCache.get(payload.vaultId) ?? 0, durable?.remoteCheckpoints?.[payload.vaultId] ?? 0, payload.snapshotSequence!);
+      if (durable) {
+        await adapter.writeSnapshotAtomically({ ...durable, remoteCheckpoints: { ...(durable.remoteCheckpoints ?? {}), [payload.vaultId]: observed } },
+          { payload: durable.vault, resetEpoch: durable.meta.resetEpoch, writeSequence: durable.meta.writeSequence });
+      }
+      remoteCheckpointCache.set(payload.vaultId, observed);
+    });
+  }
+
+  static getTrustedSnapshotSequence(vaultId: string): number { return checkpointCache.get(vaultId) ?? 0; }
+
+  static async getLegacyBackup(): Promise<EncryptedVaultPayload | null> {
+    return (await getActiveIdbAdapter().readSnapshot())?.legacyBackup ?? null;
   }
 
   /**
@@ -1243,40 +1108,25 @@ export class SyncService {
    * and increments `resetEpoch` so any in-flight async operations cannot resurrect the deleted vault.
    * Never calls `localStorage.clear()`.
    */
-  static clearLocalVault(): void {
-    if (typeof window === 'undefined') return;
-    const meta = readLocalStorageMeta();
-    const nextResetEpoch = meta.resetEpoch + 1;
-    const nextSeq = meta.writeSequence + 1;
-    const nextMeta: StorageMetaState = {
-      writeSequence: nextSeq,
-      resetEpoch: nextResetEpoch,
-      updatedAt: Date.now(),
-    };
-
-    window.localStorage.removeItem(VAULT_STORAGE_KEY);
-    window.localStorage.removeItem(SYNC_STATE_STORAGE_KEY);
-    writeLocalStorageMeta(nextMeta);
-
-    const adapter = getActiveIdbAdapter();
-    pendingIdbWritePromise = pendingIdbWritePromise
-      .catch(() => undefined)
-      .then(() => adapter.clearVaultAtomically(nextMeta))
-      .catch(() => undefined);
-
-    broadcastCrossTabUpdate({
-      type: 'VAULT_RESET',
-      vaultId: '',
-      updatedAt: new Date().toISOString(),
-      revision: 0,
-      writeSequence: nextSeq,
-      resetEpoch: nextResetEpoch,
-    });
-  }
+  static async clearLocalVault(): Promise<void> { return this.clearLocalVaultAsync(); }
 
   static async clearLocalVaultAsync(): Promise<void> {
-    this.clearLocalVault();
-    await pendingIdbWritePromise;
+    return withVaultWriteLock(async () => {
+      await pendingIdbWritePromise.catch(() => undefined);
+      const adapter = getActiveIdbAdapter();
+      const durable = await adapter.readSnapshot();
+      const localMeta = readLocalStorageMeta();
+      const meta = {
+        writeSequence: Math.max(localMeta.writeSequence, durable?.meta.writeSequence ?? 0) + 1,
+        resetEpoch: Math.max(localMeta.resetEpoch, durable?.meta.resetEpoch ?? 0) + 1,
+        updatedAt: Date.now(),
+      };
+      const snapshot: AtomicIdbSnapshot = { vault: null, syncState: null, meta, rollbackBackup: durable?.vault ?? this.getLocalVault() };
+      await adapter.writeSnapshotAtomically(snapshot, { payload: durable?.vault ?? null, resetEpoch: durable?.meta.resetEpoch ?? 0 });
+      this.mirrorCommittedSnapshot(snapshot);
+      broadcastCrossTabUpdate({ type: 'VAULT_RESET', vaultId: '', updatedAt: new Date().toISOString(), revision: 0,
+        writeSequence: meta.writeSequence, resetEpoch: meta.resetEpoch });
+    });
   }
 
   static saveRollbackBackup(payload: EncryptedVaultPayload): void {
@@ -1303,10 +1153,10 @@ export class SyncService {
     }
   }
 
-  static restoreFromRollbackBackup(): EncryptedVaultPayload | null {
+  static async restoreFromRollbackBackup(): Promise<EncryptedVaultPayload | null> {
     const backup = this.getRollbackBackup();
     if (!backup) return null;
-    this.saveLocalVault(backup, { markDirty: true });
+    await this.saveLocalVaultAsync(backup, { markDirty: true, expectedPayload: this.getLocalVault(), allowHistoricalRestore: true });
     return backup;
   }
 
@@ -1337,7 +1187,7 @@ export class SyncService {
 
   static getBackupFilename(): string {
     const dateStr = new Date().toISOString().slice(0, 10);
-    return `aegis-vault-v2-encrypted-${dateStr}.json`;
+    return `aegis-vault-v${this.getLocalVault()?.formatVersion ?? 3}-encrypted-${dateStr}.json`;
   }
 
   /**
@@ -1587,7 +1437,8 @@ export class SyncService {
     errorCategory?: SyncErrorCategory;
     message: string;
   }> {
-    this.saveLocalVault(payload, { markDirty: true });
+    await this.flushPendingPersistence();
+    if (!samePayload(this.getLocalVault(), payload)) throw new LocalVaultConflictError();
     const activeConfig = config ?? this.getSyncConfig();
     const endpoint = normalizeWorkerEndpoint(activeConfig.workerUrl, '/init');
     const cleanToken = activeConfig.apiToken.trim();
@@ -1719,6 +1570,7 @@ export class SyncService {
           lastSyncedAt: now,
         });
 
+        await this.noteVerifiedRemotePayload(payload);
         return {
           ok: true,
           status: hasNewerLocalEdit ? 'sync_pending' : 'cloud_synced',
@@ -1781,7 +1633,8 @@ export class SyncService {
     idempotentReplay?: boolean;
     message: string;
   }> {
-    this.saveLocalVault(payload, { markDirty: true });
+    await this.flushPendingPersistence();
+    if (!samePayload(this.getLocalVault(), payload)) throw new LocalVaultConflictError();
 
     const runPush = async () => {
       const activeConfig = config ?? this.getSyncConfig();
@@ -2035,6 +1888,8 @@ export class SyncService {
           const idempotentReplay = Boolean(data.idempotentReplay);
           const now = Date.now();
 
+          await this.noteVerifiedRemotePayload(targetPayload);
+
           // Check whether the user modified local records while this PUT request was in flight!
           const currentLocalAfterPush = this.getLocalVault();
           const currentHashAfterPush = currentLocalAfterPush
@@ -2270,6 +2125,8 @@ export class SyncService {
       localPayload,
     } = params;
 
+    const basePayload = localPayload === undefined ? this.getLocalVault() : localPayload;
+    if (!Number.isSafeInteger(remoteRevision) || remoteRevision < 1) throw new Error('远端版本号无效，已拒绝覆盖');
     const validation = validateV2VaultEnvelopeStructure(remotePayload);
     if (!validation.valid || !validation.payload) {
       throw new Error(`远端密文结构不合法：${validation.reason}`);
@@ -2314,7 +2171,8 @@ export class SyncService {
       );
     }
 
-    const existingLocal = localPayload ?? this.getLocalVault();
+    await this.assertSnapshotFreshness(unlocked.payload);
+    const existingLocal = basePayload;
     const syncState = this.getLocalSyncState();
     const hasConflictWithLocal = existingLocal
       ? hasEncryptedVaultDivergence(existingLocal, remotePayload) ||
@@ -2325,6 +2183,7 @@ export class SyncService {
       : false;
 
     return {
+      localBasePayload: existingLocal,
       remotePayload: unlocked.payload,
       remoteRevision,
       derivedKey: unlocked.key,
@@ -2343,16 +2202,16 @@ export class SyncService {
   /**
    * Commits a verified StagedRemotePullResult to local storage and updates `lastSyncedRevision`.
    */
-  static commitVerifiedRemotePull(
+  static async commitVerifiedRemotePull(
     staged: StagedRemotePullResult,
     config?: CloudflareSyncConfig
-  ): void {
+  ): Promise<void> {
+    await this.assertSnapshotFreshness(staged.remotePayload);
     const existingLocal = this.getLocalVault();
-    if (existingLocal) {
-      this.saveRollbackBackup(existingLocal);
-    }
-
-    this.saveLocalVault(staged.remotePayload, {
+    await this.saveLocalVaultAsync(staged.remotePayload, {
+      expectedPayload: staged.localBasePayload,
+      allowHistoricalRestore: true, fromVerifiedRemote: true, trustedRemoteSequence: staged.remotePayload.snapshotSequence,
+      rollbackBackup: existingLocal,
       markDirty: false,
       syncedRevision: staged.remoteRevision,
       pendingPasswordRotationPurge: false,
@@ -2380,6 +2239,7 @@ export class SyncService {
     status: SyncStatus;
     revision?: number;
     stagedCloud?: StagedRemotePullResult;
+    localPayload?: EncryptedVaultPayload;
     message: string;
   }> {
     const syncState = this.getLocalSyncState();
@@ -2412,7 +2272,7 @@ export class SyncService {
         currentMemorySalt: params.currentMemorySalt,
       });
 
-      this.commitVerifiedRemotePull(staged, params.config);
+      await this.commitVerifiedRemotePull(staged, params.config);
       return {
         ok: true,
         status: 'cloud_synced',
@@ -2436,22 +2296,28 @@ export class SyncService {
       );
     }
 
-    const payloadHash = computePayloadContentSignature(localVault);
-    // Rebase expectedRevision onto serverRevision and generate a fresh mutationId
-    this.saveLocalSyncState({
-      ...syncState,
-      lastSyncedRevision: conflict.serverRevision,
-      pendingMutationId: generateVaultId(),
-      pendingMutationPayloadHash: payloadHash,
-      dirtySince: Date.now(),
-      conflictState: null,
-    });
-
-    const pushRes = await this.pushVault(localVault, params.config);
+    let rebasedPayload = localVault;
+    if (localVault.formatVersion === 3 || conflict.serverVault?.formatVersion === 3) {
+      const unlocked = await unlockEncryptedVaultPayload(localVault,
+        params.currentMemoryKey && params.currentMemorySalt === localVault.kdf.salt
+          ? params.currentMemoryKey : params.masterPassword ?? '');
+      if (conflict.serverVault) {
+        await unlockEncryptedVaultPayload(conflict.serverVault,
+          conflict.serverVault.kdf.salt === localVault.kdf.salt ? unlocked.key : params.masterPassword ?? '');
+      }
+      rebasedPayload = await buildEncryptedVaultPayload(unlocked.key, localVault.kdf.salt, unlocked.records, {
+        vaultId: localVault.vaultId, previousPayload: localVault, categories: unlocked.categories,
+        iterations: localVault.kdf.iterations, createdAt: localVault.createdAt,
+        minimumSequence: Math.max(conflict.serverVault?.snapshotSequence ?? 0, this.getTrustedSnapshotSequence(localVault.vaultId)),
+      });
+    }
+    await this.saveLocalVaultAsync(rebasedPayload, { expectedPayload: localVault, syncedRevision: conflict.serverRevision, markDirty: true });
+    const pushRes = await this.pushVault(rebasedPayload, params.config);
     return {
       ok: pushRes.ok,
       status: pushRes.status,
       revision: pushRes.revision,
+      localPayload: rebasedPayload,
       message: pushRes.message,
     };
   }
@@ -2524,6 +2390,7 @@ export class SyncService {
     newCloudRevision?: number;
     recoverySummary: RecoverySummaryInfo;
   }> {
+    const existingLocal = this.getLocalVault();
     const activeConfig = params.config ?? this.getSyncConfig();
     const endpoint = normalizeWorkerEndpoint(
       activeConfig.workerUrl,
@@ -2597,19 +2464,13 @@ export class SyncService {
       );
     }
 
-    const existingLocal = this.getLocalVault();
-    if (existingLocal) {
-      this.saveRollbackBackup(existingLocal);
-    }
-
-    const restoredPayload: EncryptedVaultPayload = {
-      ...unlocked.payload,
-      updatedAt: new Date().toISOString(),
-    };
-
-    this.saveLocalVault(restoredPayload, {
-      markDirty: true,
-      syncedRevision: currentRevision,
+    const restoredPayload = await buildEncryptedVaultPayload(unlocked.key, unlocked.payload.kdf.salt, unlocked.records, {
+      vaultId: unlocked.payload.vaultId, categories: unlocked.categories, iterations: unlocked.payload.kdf.iterations,
+      createdAt: unlocked.payload.createdAt, previousPayload: unlocked.payload,
+      minimumSequence: Math.max(existingLocal?.snapshotSequence ?? 0, this.getTrustedSnapshotSequence(unlocked.payload.vaultId)),
+    });
+    await this.saveLocalVaultAsync(restoredPayload, {
+      markDirty: true, syncedRevision: currentRevision, expectedPayload: existingLocal, rollbackBackup: existingLocal,
     });
 
     const pushRes = await this.pushVault(restoredPayload, activeConfig);
@@ -2756,7 +2617,7 @@ export class SyncService {
         '已成功获取远端 V2 加密快照（尚未覆盖本地），请输入原主密码进行本地认证解密',
       candidatePayload: remotePayload,
       metadata: {
-        version: 2,
+        version: remotePayload.formatVersion,
         vaultId: remotePayload.vaultId,
         revision: remoteRevision,
         saltFingerprint: `Vault:${remotePayload.vaultId.slice(
@@ -2827,7 +2688,7 @@ export class SyncService {
         '已解析 V2 加密备份文件结构，请输入创建该备份时的主密码进行认证解密',
       candidatePayload: candidate,
       metadata: {
-        version: 2,
+        version: candidate.formatVersion,
         vaultId: candidate.vaultId,
         revision: 0,
         saltFingerprint: `Vault:${candidate.vaultId.slice(0, 8)}`,
@@ -2907,16 +2768,18 @@ export class SyncService {
       );
     }
 
-    if (existingLocal) {
-      this.saveRollbackBackup(existingLocal);
-    }
-
+    if (source === 'cloud') await this.assertSnapshotFreshness(unlocked.payload);
+    const recoveredPayload = source === 'backup-file'
+      ? await buildEncryptedVaultPayload(unlocked.key, unlocked.payload.kdf.salt, unlocked.records, {
+          vaultId: unlocked.payload.vaultId, categories: unlocked.categories, iterations: unlocked.payload.kdf.iterations,
+          createdAt: unlocked.payload.createdAt, previousPayload: unlocked.payload,
+          minimumSequence: Math.max(existingLocal?.snapshotSequence ?? 0, this.getTrustedSnapshotSequence(unlocked.payload.vaultId)),
+        }) : unlocked.payload;
     const syncedRev = source === 'cloud' ? Number(remoteRevision || 1) : 0;
-
-    await this.saveLocalVaultAsync(unlocked.payload, {
-      markDirty: false,
-      syncedRevision: syncedRev,
-      pendingPasswordRotationPurge: false,
+    await this.saveLocalVaultAsync(recoveredPayload, {
+      markDirty: source === 'backup-file', syncedRevision: syncedRev, pendingPasswordRotationPurge: false,
+      expectedPayload: existingLocal, rollbackBackup: existingLocal,
+      allowHistoricalRestore: true, fromVerifiedRemote: source === 'cloud', trustedRemoteSequence: source === 'cloud' ? recoveredPayload.snapshotSequence : undefined,
     });
 
     if (syncConfigToSave && source === 'cloud') {
@@ -2931,7 +2794,7 @@ export class SyncService {
     ).length;
 
     return {
-      payload: unlocked.payload,
+      payload: recoveredPayload,
       key: unlocked.key,
       salt: unlocked.payload.kdf.salt,
       records: unlocked.records,

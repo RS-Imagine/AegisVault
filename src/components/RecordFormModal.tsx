@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Eye,
@@ -91,8 +91,16 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const initializedRecord = useRef<string | null>(null);
 
   useEffect(() => {
+    if (!isOpen) {
+      initializedRecord.current = null;
+      return;
+    }
+    const recordKey = editingRecord?.id ?? 'new';
+    if (initializedRecord.current === recordKey) return;
+    initializedRecord.current = recordKey;
     if (isOpen) {
       setErrorMsg(null);
       setShowInlineGen(false);

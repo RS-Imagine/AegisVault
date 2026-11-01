@@ -22,6 +22,7 @@ import {
 } from './crypto/cryptoEngine';
 import {
   SyncService,
+  LocalVaultConflictError,
   subscribeToCrossTabVaultUpdates,
 } from './services/syncService';
 import { createInitialSeedRecords } from './utils/seedData';
@@ -144,6 +145,11 @@ export default function App() {
     useState<EncryptedVaultPayload | null>(null);
 
   const sessionGeneration = useRef(0);
+  const pendingLocalSave = useRef<{ payload: EncryptedVaultPayload; basePayload: EncryptedVaultPayload | null } | null>(null);
+  const [isUpgrading, setIsUpgrading] = useState(false);
+  const [upgradeError, setUpgradeError] = useState<string | null>(null);
+  const [hasLegacyBackup, setHasLegacyBackup] = useState(false);
+  const [localConflictNotice, setLocalConflictNotice] = useState<string | null>(null);
 
   // Zero-Knowledge In-Memory State (Destroyed immediately on Lock or Page Reload)
   const [memoryKey, setMemoryKey] = useState<CryptoKey | null>(null);
@@ -241,10 +247,13 @@ export default function App() {
         await SyncService.saveLocalVaultAsync(payload, {
           markDirty: false,
           syncedRevision: 0,
+          expectedPayload: null,
         });
         setPersistenceWarning(null);
-        setSyncMessage('已创建 V2 零知识密码库并加密保存至本地存储 (IndexedDB)');
+        setSyncMessage('已创建 V3 整库认证密码库并加密保存至本地存储 (IndexedDB)');
       } catch (err) {
+        if (err instanceof LocalVaultConflictError) throw err;
+        pendingLocalSave.current = { payload, basePayload: null };
         const warning = SyncService.getLastPersistenceWarning() ?? {
           code: 'STORAGE_WRITE_FAILED',
           message:
@@ -274,7 +283,7 @@ export default function App() {
     async (masterPassword: string) => {
       const generation = ++sessionGeneration.current;
       const localVault =
-        SyncService.getLocalVault() ??
+        pendingLocalSave.current?.payload ?? SyncService.getLocalVault() ??
         (await SyncService.hydrateFromIndexedDB());
       if (!localVault) {
         throw new Error('未找到本地 V2 加密密码库');
@@ -327,7 +336,7 @@ export default function App() {
     setCategories(getInitialDefaultCategories());
     setIsDemoMode(false);
     setDemoEncryptedPayload(null);
-    setEncryptedPayload(SyncService.getLocalVault());
+    setEncryptedPayload(pendingLocalSave.current?.payload ?? SyncService.getLocalVault());
     setEditingRecord(null);
     setPrefillRecordDraft(null);
     setIsGeneratorModalOpen(false);
@@ -352,6 +361,7 @@ export default function App() {
         setSyncStatus(SyncService.computeSyncStatus());
         setConflictInfo(SyncService.getLocalSyncState().conflictState);
         setIsHydratingStorage(false);
+        void SyncService.getLegacyBackup().then((backup) => { if (!cancelled) setHasLegacyBackup(Boolean(backup)); });
       })
       .catch(() => {
         if (!cancelled) {
@@ -371,7 +381,12 @@ export default function App() {
 
       const latestVault = SyncService.getLocalVault();
       const latestSync = SyncService.getLocalSyncState();
-      setEncryptedPayload(latestVault);
+      if (!memoryKey) setEncryptedPayload(latestVault);
+      if (pendingLocalSave.current) {
+        setSyncStatus('failed');
+        setSyncMessage('其他标签页已更新密码库。请先导出当前未保存的加密备份，再刷新载入最新版本。');
+        return;
+      }
       setConflictInfo(latestSync.conflictState);
       setSyncStatus(SyncService.computeSyncStatus());
 
@@ -389,6 +404,7 @@ export default function App() {
           .then((unlocked) => {
             if (cancelled || updateGeneration !== sessionGeneration.current ||
                 readSequence !== crossTabReadSequence) return;
+            setEncryptedPayload(unlocked.payload);
             setDecryptedRecords(unlocked.records);
             setCategories(unlocked.categories);
           })
@@ -461,14 +477,15 @@ export default function App() {
   }, [memoryKey, handleLockVault]);
 
   // Reset Local Vault (atomically wipes both IndexedDB and localStorage V2 keys, increments resetEpoch)
-  const handleResetVault = useCallback(() => {
+  const handleResetVault = useCallback(async () => {
     handleLockVault();
-    const existing = SyncService.getLocalVault();
-    if (existing) {
-      SyncService.saveRollbackBackup(existing);
-      setHasRollbackBackup(true);
+    try { await SyncService.clearLocalVaultAsync(); }
+    catch (error) {
+      setPersistenceWarning({ code: 'IDB_TRANSACTION_FAILED', message: error instanceof Error ? error.message : '清除失败，原密码库仍可恢复', occurredAt: Date.now() });
+      return;
     }
-    void SyncService.clearLocalVaultAsync();
+    pendingLocalSave.current = null;
+    setHasRollbackBackup(Boolean(SyncService.getRollbackBackup()));
     setEncryptedPayload(null);
     setDemoEncryptedPayload(null);
     setIsDemoMode(false);
@@ -530,7 +547,7 @@ export default function App() {
         );
       } else {
         setSyncStatus('local_saved');
-        setSyncMessage('已从 V2 加密备份文件完整恢复密码库至本地存储 (IndexedDB)');
+        setSyncMessage('已从加密备份文件完整恢复密码库至本地存储 (IndexedDB)');
       }
 
       if (typeof window !== 'undefined') {
@@ -541,9 +558,11 @@ export default function App() {
   );
 
   // Rollback to previous local vault before recovery/overwrite
-  const handleRollbackToPreviousLocalVault = useCallback(() => {
+  const handleRollbackToPreviousLocalVault = useCallback(async () => {
     handleLockVault();
-    const restored = SyncService.restoreFromRollbackBackup();
+    let restored: EncryptedVaultPayload | null;
+    try { restored = await SyncService.restoreFromRollbackBackup(); }
+    catch (error) { setSyncMessage(error instanceof Error ? error.message : '回滚保存失败'); return; }
     if (!restored) return;
     setMemoryKey(null);
     setMemorySalt(null);
@@ -573,25 +592,26 @@ export default function App() {
         throw new Error('未找到可轮换主密码的本地 V2 密码库');
       }
 
-      SyncService.saveRollbackBackup(currentVault);
-      setHasRollbackBackup(true);
-
       try {
         const rotated = await rotateVaultMasterPassword(
           currentVault,
           oldPassword,
           newPassword,
-          currentVault.kdf.iterations
+          currentVault.kdf.iterations,
+          SyncService.getTrustedSnapshotSequence(currentVault.vaultId)
         );
 
         if (generation !== sessionGeneration.current) return;
         await SyncService.saveLocalVaultAsync(rotated.newPayload, {
           markDirty: true,
           pendingPasswordRotationPurge: purgePreviousCloudSnapshots,
+          expectedPayload: currentVault,
+          rollbackBackup: currentVault,
         });
 
         if (generation !== sessionGeneration.current) return;
         setPersistenceWarning(null);
+        setHasRollbackBackup(true);
         setEncryptedPayload(rotated.newPayload);
         setMemoryKey(rotated.newKey);
         setMemorySalt(rotated.newSalt);
@@ -599,12 +619,9 @@ export default function App() {
         setCategories(rotated.categories);
         setSyncStatus(SyncService.computeSyncStatus());
         setSyncMessage(
-          '已完成 V2 主密码与密钥轮换（vaultId 保持不变，本地 IndexedDB 已更新，待同步云端）'
+          '已完成主密码与密钥轮换（vaultId 保持不变，本地 IndexedDB 已更新，待同步云端）'
         );
       } catch (err) {
-        if (generation === sessionGeneration.current) {
-          SyncService.saveLocalVault(currentVault, { markDirty: false });
-        }
         throw err;
       }
     },
@@ -639,6 +656,7 @@ export default function App() {
             iterations: demoEncryptedPayload?.kdf.iterations,
             createdAt: demoEncryptedPayload?.createdAt,
             existingVerifier: demoEncryptedPayload?.verifier,
+            previousPayload: demoEncryptedPayload ?? undefined,
           }
         );
         if (generation !== sessionGeneration.current) return;
@@ -658,26 +676,31 @@ export default function App() {
           iterations: encryptedPayload?.kdf.iterations,
           createdAt: encryptedPayload?.createdAt,
           existingVerifier: encryptedPayload?.verifier,
+          previousPayload: encryptedPayload ?? undefined,
+          formatVersion: encryptedPayload?.formatVersion,
+          minimumSequence: SyncService.getTrustedSnapshotSequence(encryptedPayload?.vaultId ?? ''),
         }
       );
 
       if (generation !== sessionGeneration.current) return;
-      // Always keep in-memory state intact even if disk/IndexedDB throws QuotaExceededError
-      setEncryptedPayload(nextPayload);
-      setDecryptedRecords(nextRecords);
-      setCategories(effectiveCategories);
-
+      const basePayload = pendingLocalSave.current ? pendingLocalSave.current.basePayload : encryptedPayload;
       try {
-        await SyncService.saveLocalVaultAsync(nextPayload, { markDirty: true });
+        await SyncService.saveLocalVaultAsync(nextPayload, { markDirty: true, expectedPayload: basePayload });
+        pendingLocalSave.current = null;
+        if (generation !== sessionGeneration.current) return;
+        setEncryptedPayload(nextPayload);
+        setDecryptedRecords(nextRecords);
+        setCategories(effectiveCategories);
         setPersistenceWarning(null);
       } catch (err) {
+        if (err instanceof LocalVaultConflictError) throw err;
+        // Keep the encrypted candidate and its original base for safe retry/export.
+        pendingLocalSave.current = { payload: nextPayload, basePayload };
+        setEncryptedPayload(nextPayload);
+        setDecryptedRecords(nextRecords);
+        setCategories(effectiveCategories);
         const warning = SyncService.getLastPersistenceWarning() ?? {
-          code: 'STORAGE_WRITE_FAILED',
-          message:
-            err instanceof Error
-              ? err.message
-              : '写入本地 IndexedDB 失败，请立即导出加密备份',
-          occurredAt: Date.now(),
+          code: 'STORAGE_WRITE_FAILED', message: err instanceof Error ? err.message : '保存失败，请导出加密备份', occurredAt: Date.now(),
         };
         setPersistenceWarning(warning);
         setSyncStatus('failed');
@@ -719,10 +742,10 @@ export default function App() {
   const handleRetryLocalSave = useCallback(async () => {
     if (!encryptedPayload || isDemoMode) return;
     try {
-      SyncService.__setSimulatePersistenceFailureForTests(null);
       await SyncService.saveLocalVaultAsync(encryptedPayload, {
-        markDirty: true,
+        markDirty: true, expectedPayload: pendingLocalSave.current ? pendingLocalSave.current.basePayload : encryptedPayload,
       });
+      pendingLocalSave.current = null;
       SyncService.clearPersistenceWarning();
       setPersistenceWarning(null);
       setSyncStatus(SyncService.computeSyncStatus());
@@ -748,6 +771,10 @@ export default function App() {
       let nextRecords: DecryptedVaultRecord[];
 
       if (existingId) {
+        const latest = decryptedRecords.find((record) => record.id === existingId);
+        if (!latest || (editingRecord?.id === existingId && JSON.stringify(latest) !== JSON.stringify(editingRecord))) {
+          throw new LocalVaultConflictError();
+        }
         nextRecords = decryptedRecords.map((r) =>
           r.id === existingId
             ? {
@@ -769,14 +796,15 @@ export default function App() {
 
       await persistUpdatedVault(nextRecords);
     },
-    [decryptedRecords, persistUpdatedVault]
+    [decryptedRecords, editingRecord, persistUpdatedVault]
   );
 
   // Delete a Record
   const handleDeleteRecord = useCallback(
     async (id: string) => {
       const nextRecords = decryptedRecords.filter((r) => r.id !== id);
-      await persistUpdatedVault(nextRecords);
+      try { await persistUpdatedVault(nextRecords); }
+      catch (error) { setLocalConflictNotice(error instanceof Error ? error.message : '保存未完成，请重试'); }
     },
     [decryptedRecords, persistUpdatedVault]
   );
@@ -789,7 +817,8 @@ export default function App() {
           ? { ...r, favorite: !r.favorite, updatedAt: Date.now() }
           : r
       );
-      await persistUpdatedVault(nextRecords);
+      try { await persistUpdatedVault(nextRecords); }
+      catch (error) { setLocalConflictNotice(error instanceof Error ? error.message : '保存未完成，请重试'); }
     },
     [decryptedRecords, persistUpdatedVault]
   );
@@ -927,7 +956,8 @@ export default function App() {
           return;
         }
 
-        SyncService.commitVerifiedRemotePull(staged, cfg);
+        await SyncService.commitVerifiedRemotePull(staged, cfg);
+        if (generation !== sessionGeneration.current) return;
         setSyncConfig(SyncService.getSyncConfig());
         setEncryptedPayload(staged.remotePayload);
         setMemoryKey(staged.derivedKey);
@@ -960,9 +990,12 @@ export default function App() {
   );
 
   // Confirm applying a verified staged remote pull over local data
-  const handleConfirmStagedPull = useCallback(() => {
+  const handleConfirmStagedPull = useCallback(async () => {
     if (!stagedPull) return;
-    SyncService.commitVerifiedRemotePull(stagedPull, syncConfig);
+    const generation = sessionGeneration.current;
+    try { await SyncService.commitVerifiedRemotePull(stagedPull, syncConfig); }
+    catch (error) { setSyncMessage(error instanceof Error ? error.message : '本地版本已更新，请重新拉取'); return; }
+    if (generation !== sessionGeneration.current) return;
     setSyncConfig(SyncService.getSyncConfig());
     setEncryptedPayload(stagedPull.remotePayload);
     setMemoryKey(stagedPull.derivedKey);
@@ -1007,6 +1040,7 @@ export default function App() {
       setHasRollbackBackup(Boolean(SyncService.getRollbackBackup()));
 
       if (generation !== sessionGeneration.current) return;
+      if (res.localPayload) setEncryptedPayload(res.localPayload);
       if (res.stagedCloud) {
         setEncryptedPayload(res.stagedCloud.remotePayload);
         setMemoryKey(res.stagedCloud.derivedKey);
@@ -1051,6 +1085,34 @@ export default function App() {
     },
     [syncConfig, memoryKey, memorySalt]
   );
+
+  const handleUpgradeVault = useCallback(async () => {
+    if (!memoryKey || !encryptedPayload || encryptedPayload.formatVersion !== 2 || pendingLocalSave.current) return;
+    const base = encryptedPayload;
+    const generation = sessionGeneration.current;
+    setIsUpgrading(true);
+    setUpgradeError(null);
+    try {
+      const upgraded = await buildEncryptedVaultPayload(memoryKey, base.kdf.salt, decryptedRecords, {
+        vaultId: base.vaultId, previousPayload: base, categories, iterations: base.kdf.iterations,
+        createdAt: base.createdAt, minimumSequence: SyncService.getTrustedSnapshotSequence(base.vaultId),
+      });
+      await unlockEncryptedVaultPayload(upgraded, memoryKey);
+      if (generation !== sessionGeneration.current) return;
+      await SyncService.saveLocalVaultAsync(upgraded, { expectedPayload: base, legacyBackup: base, rollbackBackup: base });
+      if (generation !== sessionGeneration.current) return;
+      setEncryptedPayload(upgraded);
+      setHasLegacyBackup(true);
+      setSyncStatus(SyncService.computeSyncStatus());
+      setSyncMessage('已升级为 V3 整库认证格式，原 V2 密文备份已保留；待同步云端。');
+    } catch (error) { setUpgradeError(error instanceof Error ? error.message : '升级失败，原密码库保持不变'); }
+    finally { setIsUpgrading(false); }
+  }, [memoryKey, encryptedPayload, decryptedRecords, categories]);
+
+  const handleExportLegacyBackup = useCallback(async () => {
+    const backup = await SyncService.getLegacyBackup();
+    if (backup) await exportBackupFileCrossPlatform(JSON.stringify(backup, null, 2), 'aegis-vault-v2-before-upgrade.json');
+  }, []);
 
   // Export Encrypted V2 Vault JSON as a local file for offline backup (Desktop, Windows Portable WebView2, and Android App)
   const handleExportEncryptedVault = useCallback(() => {
@@ -1157,6 +1219,27 @@ export default function App() {
           setPersistenceWarning(null);
         }}
       />
+
+      {localConflictNotice && (
+        <div role="alert" className="m-4 p-3 rounded-lg bg-amber-100 text-amber-950">
+          {localConflictNotice}
+          <button className="ml-3 underline" onClick={() => setLocalConflictNotice(null)}>关闭提示</button>
+        </div>
+      )}
+      {isUnlocked && !isDemoMode && encryptedPayload?.formatVersion === 2 && (
+        <div role="status" className="mx-auto max-w-6xl m-4 p-4 rounded-xl bg-amber-100 text-amber-950 dark:bg-amber-950 dark:text-amber-100">
+          <p>当前密码库使用 V2 格式。升级到 V3 可检测记录删减和整库篡改，并自动保留原 V2 加密备份。升级后请使用新版客户端和同步服务。</p>
+          <button disabled={isUpgrading} onClick={() => void handleUpgradeVault()} className="mt-2 px-3 py-2 rounded bg-amber-900 text-white disabled:opacity-50">
+            {isUpgrading ? '正在升级…' : '备份并升级到 V3'}
+          </button>
+          {upgradeError && <p role="alert">{upgradeError}</p>}
+        </div>
+      )}
+      {isUnlocked && hasLegacyBackup && encryptedPayload?.formatVersion === 3 && (
+        <div className="mx-auto max-w-6xl px-4 pt-2 text-sm">
+          <button onClick={() => void handleExportLegacyBackup()} className="text-blue-600 underline">导出升级前的 V2 加密备份</button>
+        </div>
+      )}
 
       {!isUnlocked ? (
         <MasterAuthScreen

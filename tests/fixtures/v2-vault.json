@@ -1,0 +1,35 @@
+{
+  "formatVersion": 2,
+  "vaultId": "00000000-1111-4222-8333-444444444444",
+  "createdAt": "2026-11-01T13:40:23.568Z",
+  "updatedAt": "2026-11-01T13:40:23.568Z",
+  "kdf": {
+    "algorithm": "PBKDF2-HMAC-SHA256",
+    "hash": "SHA-256",
+    "iterations": 100000,
+    "salt": "IBl8sAchNeIRS5vV2lYn6A=="
+  },
+  "cipher": {
+    "algorithm": "AES-GCM",
+    "keyLength": 256,
+    "ivLength": 12
+  },
+  "verifier": {
+    "iv": "WKAKvXXyjP1hCTPH",
+    "ciphertext": "v9rohpZWVRETXA+NFYOr0NCgGL6dNkVTzmsnfd3cjwVwXOZ8quTslbWEzwF+fpWy5dPtQmFuFF8J"
+  },
+  "encryptedMetadata": {
+    "iv": "dANGrKEAxddYQekD",
+    "ciphertext": "lStENV/yZGvNPtT9plnJ95myhmrBFDAGfEWwuTuplMmhrtWu/b7FzmyX2BlHMGwDsG0AYyWiXisr5L4jMB2h8tzZkxBuo98Ku579FZwM8guHYIsdvdD8NH+tGI/qqbZUSpVlxQC0U5ofFcs7oWUZpz3cqzFFLElVRMtVtjHAFhAhm4GyVefae5ZGGg4JWTf94zMDxHonHkzNsj16+livWyonzO+igQdKjputtGCRvZB0H8V8U3ff5iUVYSFLVjVi35BEeJNwyRzVqzDLqm88B50odJon36RtK1jISrdI+2QQu3pWx/nGyw5c3YdWJXzflC1vy8vUohqlOueOUjt/m4+/RZki/gZiuaPwc7h+MSKg4KK1jzAUNcioGclWlCblSSNOzo0wltk5Jj3S+qu2pn8MLlMXpa6+BtULlf3v6+xm81vTPTnCq8FMDZGEn3XfWD/N64gwVfGH/6lPjjC1rI5vypHSSKYtNPU9K4cmPR+3swjjZmL6O4aZBEzjvQvANYnZVvmH0igsVxxJVPrW9W5HnrmCkfzgrt36FgtX3fXWGd8+KNRemzPzDJWOcy0GLBRINldw4wsj0I3y1bKOFTAk/vrreMMx4L+bUGBCoBRRXsaTYmpK9cSg7OgI776saT8v5StNx+8hT9Hn9Z44LVhpS4EHu68a3CmNZl1IgzF4sDVdyjZY52edUuPld+ZufyTkMEIhIS6jQkMBAudfn6kZ"
+  },
+  "encryptedRecords": [
+    {
+      "id": "legacy-login",
+      "recordType": "login",
+      "iv": "bV5tVMr6qtVJxKbl",
+      "ciphertext": "k6S0Z2deKkg6C2cjENV+a6qV+t9kOMiJTodPDuaGaQuZbSAObX4z16lXuJBqWmnncgDYhkSq0DQwnBoJUK0jLjF7SCoHuTqJw3rWgver27TkEPOnr1ENTzonK2POa27XNpQDXiaiHOyqTFAPdw5G+wTVh1NxmX4/rAWY4A34od6ySfpwVP+UedQY3IVEO0PymBRUyM3V99ozr7NkEV21Ktb/fA+5XZLHK7jdQxvdRuor7W+QA++/bhu7/y5NBpQSrbWoyIpwV+ZQhGNSB8g3vbj5G+pHEbl89sW8Wni1fy5PnXq2JrrziKK2lRTl4afbHPyQcLvdyHyjlOmsBlSntcLLhOIEbPkPIqXOTUxfzBGORc+HWcbdNej34DL1+pxc+ysG5xeuTLn5DguRjYzU1B3zQN1JV5hxkDB1dKZoOmWYvSi/B0SoC1PPSkfvX5ZfkjQ8",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000000000
+    }
+  ]
+}

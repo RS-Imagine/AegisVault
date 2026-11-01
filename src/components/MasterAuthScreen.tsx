@@ -174,8 +174,10 @@ export const MasterAuthScreen: React.FC<MasterAuthScreenProps> = ({
       setIsSubmitting(true);
       try {
         await onUnlockVault(password);
-      } catch {
-        setErrorMsg('主密码错误，请核对后重试。');
+      } catch (error) {
+        setErrorMsg(error instanceof Error && error.message.startsWith('整库完整性认证失败')
+          ? '密码库完整性校验失败，已拒绝解锁。请保留原文件并尝试可信备份。'
+          : '主密码错误，请核对后重试。');
       } finally {
         setIsSubmitting(false);
       }
@@ -1107,7 +1109,7 @@ export const MasterAuthScreen: React.FC<MasterAuthScreenProps> = ({
                 <span className="font-semibold text-slate-800 dark:text-slate-200">
                   模式说明：
                 </span>
-                此入口用于在空白设备或新环境中<strong>完整恢复整个 AegisVault V2 加密密码库</strong>（<code className="font-mono">formatVersion: 2</code>，含独立 <code className="font-mono">vaultId</code>、加密分类元数据与 AAD 绑定记录）。若您只需将记录导入合并至已解锁的密码库，请先解锁后使用工作台顶部的「导入密码数据」。
+                此入口用于在空白设备或新环境中<strong>完整恢复 AegisVault 加密密码库</strong>（<code className="font-mono">formatVersion: 2 或 3</code>，含独立 <code className="font-mono">vaultId</code>、加密分类元数据与 AAD 绑定记录）。若您只需将记录导入合并至已解锁的密码库，请先解锁后使用工作台顶部的「导入密码数据」。
               </div>
 
               <div className="space-y-3">

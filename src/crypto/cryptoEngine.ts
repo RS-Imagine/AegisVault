@@ -1,15 +1,7 @@
 /**
- * AegisVault V2 Zero-Knowledge Web Crypto Engine
- *
- * Security Guarantees:
- * - Key Derivation: PBKDF2-HMAC-SHA256 with 600,000 default iterations & 128-bit CSPRNG salt
- * - Encryption: AES-256-GCM with 96-bit CSPRNG IV and 128-bit authentication tag
- * - Additional Authenticated Data (AAD):
- *     * verifier bound to: aegis-v2:verifier:${vaultId}:2:${iterations}:${salt}
- *     * encryptedMetadata bound to: aegis-v2:metadata:${vaultId}:2
- *     * encryptedRecords[i] bound to: aegis-v2:record:${vaultId}:2:${id}:${recordType}:${createdAt}:${updatedAt}
- * - Independent `vaultId`: Preserved across Master Password rotations while `kdf.salt` and keys are rotated
- * - Zero V1 Legacy Compatibility: Strictly requires `formatVersion === 2`
+ * V3 authenticates the entire encrypted envelope, including record order and
+ * snapshot sequence. Versioned AAD keeps V2 readable and prevents stripping a
+ * V3 integrity tag to downgrade its ciphertext to V2. Keys stay non-extractable.
  */
 
 import {
@@ -26,9 +18,10 @@ import {
   sanitizeCategoriesList,
   syncCategoriesWithRecords,
 } from '../utils/categoryManager';
-import { findUnexpectedEnvelopeField } from '../../shared/vaultEnvelopeSchema';
+import { canonicalJson, findUnexpectedEnvelopeField } from '../../shared/vaultEnvelopeSchema';
 
-export const VAULT_FORMAT_VERSION = 2 as const;
+export const VAULT_FORMAT_VERSION = 3 as const;
+export type VaultFormatVersion = 2 | 3;
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
 export const MIN_PBKDF2_ITERATIONS = 100_000;
 export const MAX_PBKDF2_ITERATIONS = 2_000_000;
@@ -95,16 +88,17 @@ export function generateVaultId(): string {
 export function buildVerifierAAD(
   vaultId: string,
   iterations: number,
-  saltBase64: string
+  saltBase64: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Uint8Array {
   return new TextEncoder().encode(
-    `aegis-v2:verifier:${vaultId}:${VAULT_FORMAT_VERSION}:${iterations}:${saltBase64}`
+    `aegis-v${formatVersion}:verifier:${vaultId}:${formatVersion}:${iterations}:${saltBase64}`
   );
 }
 
-export function buildMetadataAAD(vaultId: string): Uint8Array {
+export function buildMetadataAAD(vaultId: string, formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION): Uint8Array {
   return new TextEncoder().encode(
-    `aegis-v2:metadata:${vaultId}:${VAULT_FORMAT_VERSION}`
+    `aegis-v${formatVersion}:metadata:${vaultId}:${formatVersion}`
   );
 }
 
@@ -113,10 +107,11 @@ export function buildRecordAAD(
   recordId: string,
   recordType: RecordType,
   createdAt: number,
-  updatedAt: number
+  updatedAt: number,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Uint8Array {
   return new TextEncoder().encode(
-    `aegis-v2:record:${vaultId}:${VAULT_FORMAT_VERSION}:${recordId}:${recordType}:${createdAt}:${updatedAt}`
+    `aegis-v${formatVersion}:record:${vaultId}:${formatVersion}:${recordId}:${recordType}:${createdAt}:${updatedAt}`
   );
 }
 
@@ -246,9 +241,10 @@ export async function createVaultVerifier(
   key: CryptoKey,
   vaultId: string,
   iterations: number,
-  saltBase64: string
+  saltBase64: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<EncryptedBlob> {
-  const aad = buildVerifierAAD(vaultId, iterations, saltBase64);
+  const aad = buildVerifierAAD(vaultId, iterations, saltBase64, formatVersion);
   return encryptStringWithAAD(VERIFIER_MAGIC_TEXT, key, aad);
 }
 
@@ -257,10 +253,11 @@ export async function verifyVaultKey(
   key: CryptoKey,
   vaultId: string,
   iterations: number,
-  saltBase64: string
+  saltBase64: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<boolean> {
   try {
-    const aad = buildVerifierAAD(vaultId, iterations, saltBase64);
+    const aad = buildVerifierAAD(vaultId, iterations, saltBase64, formatVersion);
     const result = await decryptStringWithAAD(verifier, key, aad);
     return result === VERIFIER_MAGIC_TEXT;
   } catch {
@@ -271,22 +268,24 @@ export async function verifyVaultKey(
 export async function encryptVaultMetadata(
   categories: VaultCategoryItem[],
   key: CryptoKey,
-  vaultId: string
+  vaultId: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<EncryptedBlob> {
   const metadata: DecryptedVaultMetadata = {
     categories: sanitizeCategoriesList(categories),
     updatedAt: Date.now(),
   };
-  const aad = buildMetadataAAD(vaultId);
+  const aad = buildMetadataAAD(vaultId, formatVersion);
   return encryptStringWithAAD(JSON.stringify(metadata), key, aad);
 }
 
 export async function decryptVaultMetadata(
   encryptedMetadata: EncryptedBlob,
   key: CryptoKey,
-  vaultId: string
+  vaultId: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<DecryptedVaultMetadata> {
-  const aad = buildMetadataAAD(vaultId);
+  const aad = buildMetadataAAD(vaultId, formatVersion);
   const json = await decryptStringWithAAD(encryptedMetadata, key, aad);
   const parsed = JSON.parse(json) as Partial<DecryptedVaultMetadata>;
   if (!parsed || !Array.isArray(parsed.categories)) {
@@ -301,7 +300,8 @@ export async function decryptVaultMetadata(
 export async function encryptVaultRecord(
   record: DecryptedVaultRecord,
   key: CryptoKey,
-  vaultId: string
+  vaultId: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<EncryptedVaultRecord> {
   const recordType: RecordType =
     record.recordType || (record.category === 'bank-card' ? 'card' : 'login');
@@ -315,7 +315,7 @@ export async function encryptVaultRecord(
     updatedAt,
   };
 
-  const aad = buildRecordAAD(vaultId, record.id, recordType, createdAt, updatedAt);
+  const aad = buildRecordAAD(vaultId, record.id, recordType, createdAt, updatedAt, formatVersion);
   const blob = await encryptStringWithAAD(JSON.stringify(normalizedRecord), key, aad);
 
   return {
@@ -331,7 +331,8 @@ export async function encryptVaultRecord(
 export async function decryptVaultRecord(
   encryptedRecord: EncryptedVaultRecord,
   key: CryptoKey,
-  vaultId: string
+  vaultId: string,
+  formatVersion: VaultFormatVersion = VAULT_FORMAT_VERSION
 ): Promise<DecryptedVaultRecord> {
   const recordType: RecordType = encryptedRecord.recordType || 'login';
   const aad = buildRecordAAD(
@@ -339,7 +340,8 @@ export async function decryptVaultRecord(
     encryptedRecord.id,
     recordType,
     encryptedRecord.createdAt,
-    encryptedRecord.updatedAt
+    encryptedRecord.updatedAt,
+    formatVersion
   );
   const json = await decryptStringWithAAD(
     { iv: encryptedRecord.iv, ciphertext: encryptedRecord.ciphertext },
@@ -354,7 +356,8 @@ export async function decryptVaultRecord(
 }
 
 /**
- * Strictly validates a V2 EncryptedVaultPayload before any decryption or storage.
+ * Validates a V2 or V3 envelope before decryption or storage.
+ * The historical export name is retained for existing callers.
  * Rejects V1 payloads (`version: 1`) or payloads containing plaintext fields.
  */
 export function validateV2VaultEnvelopeStructure(
@@ -376,10 +379,10 @@ export function validateV2VaultEnvelopeStructure(
     return { valid: false, reason: `密文信封包含未允许字段：${unexpectedField}` };
   }
 
-  if (obj.formatVersion !== VAULT_FORMAT_VERSION) {
+  if (obj.formatVersion !== 2 && obj.formatVersion !== 3) {
     return {
       valid: false,
-      reason: `不支持的密码库版本 formatVersion: ${String(obj.formatVersion)} (要求版本 2)`,
+      reason: `不支持的密码库版本 formatVersion: ${String(obj.formatVersion)} (支持版本 2 和 3)`,
     };
   }
 
@@ -391,7 +394,8 @@ export function validateV2VaultEnvelopeStructure(
     return { valid: false, reason: '缺少有效的独立密码库标识 vaultId' };
   }
 
-  if (typeof obj.createdAt !== 'string' || typeof obj.updatedAt !== 'string') {
+  if (typeof obj.createdAt !== 'string' || typeof obj.updatedAt !== 'string' ||
+      !Number.isFinite(Date.parse(obj.createdAt)) || !Number.isFinite(Date.parse(obj.updatedAt))) {
     return { valid: false, reason: '缺少 createdAt 或 updatedAt 时间戳' };
   }
 
@@ -456,6 +460,16 @@ export function validateV2VaultEnvelopeStructure(
     return null;
   };
 
+  if (obj.formatVersion === 3) {
+    if (!Number.isSafeInteger(obj.snapshotSequence) || Number(obj.snapshotSequence) < 1) {
+      return { valid: false, reason: 'V3 快照序号无效' };
+    }
+    const integrityError = checkBlob(obj.integrity, 'integrity');
+    if (integrityError) return { valid: false, reason: integrityError };
+  } else if ('integrity' in obj || 'snapshotSequence' in obj) {
+    return { valid: false, reason: 'V2 信封不得携带 V3 认证字段' };
+  }
+
   const verifierErr = checkBlob(obj.verifier, 'verifier');
   if (verifierErr) return { valid: false, reason: verifierErr };
 
@@ -466,6 +480,7 @@ export function validateV2VaultEnvelopeStructure(
     return { valid: false, reason: 'encryptedRecords 必须是数组' };
   }
 
+  const seenIds = new Set<string>();
   for (let i = 0; i < obj.encryptedRecords.length; i++) {
     const rec = obj.encryptedRecords[i] as Record<string, unknown>;
     if (!rec || typeof rec !== 'object' || Array.isArray(rec)) {
@@ -474,10 +489,13 @@ export function validateV2VaultEnvelopeStructure(
     if (typeof rec.id !== 'string' || !rec.id.trim()) {
       return { valid: false, reason: `encryptedRecords[${i}].id 无效` };
     }
+    if (seenIds.has(rec.id as string)) return { valid: false, reason: '记录 ID 重复' };
+    seenIds.add(rec.id as string);
     if (!['login', 'card', 'identity', 'note'].includes(String(rec.recordType))) {
       return { valid: false, reason: `encryptedRecords[${i}].recordType 无效` };
     }
-    if (typeof rec.createdAt !== 'number' || typeof rec.updatedAt !== 'number') {
+    if (typeof rec.createdAt !== 'number' || typeof rec.updatedAt !== 'number' ||
+        !Number.isFinite(rec.createdAt) || !Number.isFinite(rec.updatedAt) || rec.createdAt <= 0 || rec.updatedAt <= 0) {
       return { valid: false, reason: `encryptedRecords[${i}] 时间戳无效` };
     }
     const recErr = checkBlob(
@@ -491,7 +509,7 @@ export function validateV2VaultEnvelopeStructure(
 }
 
 /**
- * Builds a complete V2 EncryptedVaultPayload with AAD-bound verifier, metadata, and records.
+ * Builds a versioned encrypted snapshot; new vaults default to V3 whole-vault authentication.
  */
 export async function buildEncryptedVaultPayload(
   key: CryptoKey,
@@ -499,13 +517,17 @@ export async function buildEncryptedVaultPayload(
   records: DecryptedVaultRecord[],
   options: {
     vaultId?: string;
+    formatVersion?: VaultFormatVersion;
+    previousPayload?: EncryptedVaultPayload;
+    minimumSequence?: number;
     categories?: VaultCategoryItem[];
     iterations?: number;
     createdAt?: string;
     existingVerifier?: EncryptedBlob;
   } = {}
 ): Promise<EncryptedVaultPayload> {
-  const vaultId = options.vaultId || generateVaultId();
+  const formatVersion = options.formatVersion ?? VAULT_FORMAT_VERSION;
+  const vaultId = options.vaultId || options.previousPayload?.vaultId || generateVaultId();
   const iterations = options.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
   const nowIso = new Date().toISOString();
   const createdAt = options.createdAt || nowIso;
@@ -516,21 +538,22 @@ export async function buildEncryptedVaultPayload(
   );
 
   const verifier =
-    options.existingVerifier ||
-    (await createVaultVerifier(key, vaultId, iterations, saltBase64));
+    (options.previousPayload?.formatVersion === formatVersion ? options.existingVerifier : undefined) ||
+    (await createVaultVerifier(key, vaultId, iterations, saltBase64, formatVersion));
 
   const encryptedMetadata = await encryptVaultMetadata(
     syncedCategories,
     key,
-    vaultId
+    vaultId,
+    formatVersion
   );
 
   const encryptedRecords = await Promise.all(
-    records.map((r) => encryptVaultRecord(r, key, vaultId))
+    records.map((r) => encryptVaultRecord(r, key, vaultId, formatVersion))
   );
 
-  return {
-    formatVersion: VAULT_FORMAT_VERSION,
+  const payload: EncryptedVaultPayload = {
+    formatVersion,
     vaultId,
     createdAt,
     updatedAt: nowIso,
@@ -549,6 +572,17 @@ export async function buildEncryptedVaultPayload(
     encryptedMetadata,
     encryptedRecords,
   };
+  if (formatVersion === 3) {
+    payload.snapshotSequence = Math.max(options.previousPayload?.snapshotSequence ?? 0, options.minimumSequence ?? 0) + 1;
+    if (!Number.isSafeInteger(payload.snapshotSequence)) throw new Error('快照序号超过安全范围');
+    payload.integrity = await encryptStringWithAAD('AEGIS_V3_SNAPSHOT', key, buildSnapshotAAD(payload));
+  }
+  return payload;
+}
+
+export function buildSnapshotAAD(payload: EncryptedVaultPayload): Uint8Array {
+  const { integrity: _integrity, ...body } = payload;
+  return new TextEncoder().encode(`aegis-v3:snapshot:${canonicalJson(body)}`);
 }
 
 /**
@@ -584,15 +618,25 @@ export async function unlockEncryptedVaultPayload(
     key,
     v2.vaultId,
     v2.kdf.iterations,
-    v2.kdf.salt
+    v2.kdf.salt,
+    v2.formatVersion
   );
   if (!isVerifierOk) {
     throw new Error('主密码错误或密文校验器 (Verifier) 认证失败');
   }
 
+  if (v2.formatVersion === 3) {
+    try {
+      const authenticated = await decryptStringWithAAD(v2.integrity!, key, buildSnapshotAAD(v2));
+      if (authenticated !== 'AEGIS_V3_SNAPSHOT') throw new Error('Invalid snapshot verifier');
+    } catch {
+      throw new Error('整库完整性认证失败：记录清单或快照元数据已被修改，拒绝加载');
+    }
+  }
+
   let metadata: DecryptedVaultMetadata;
   try {
-    metadata = await decryptVaultMetadata(v2.encryptedMetadata, key, v2.vaultId);
+    metadata = await decryptVaultMetadata(v2.encryptedMetadata, key, v2.vaultId, v2.formatVersion);
   } catch {
     throw new Error('加密分类元数据 (encryptedMetadata) GCM 认证标签校验失败，数据可能遭篡改');
   }
@@ -600,7 +644,7 @@ export async function unlockEncryptedVaultPayload(
   let records: DecryptedVaultRecord[];
   try {
     records = await Promise.all(
-      v2.encryptedRecords.map((enc) => decryptVaultRecord(enc, key, v2.vaultId))
+      v2.encryptedRecords.map((enc) => decryptVaultRecord(enc, key, v2.vaultId, v2.formatVersion))
     );
   } catch {
     throw new Error('密码库记录密文 GCM 认证标签校验失败，拒绝加载不完整数据');
@@ -628,7 +672,8 @@ export async function rotateVaultMasterPassword(
   currentVault: EncryptedVaultPayload,
   oldMasterPassword: string,
   newMasterPassword: string,
-  newIterations: number = DEFAULT_PBKDF2_ITERATIONS
+  newIterations: number = DEFAULT_PBKDF2_ITERATIONS,
+  minimumSequence: number = 0
 ): Promise<{
   newPayload: EncryptedVaultPayload;
   newKey: CryptoKey;
@@ -664,6 +709,8 @@ export async function rotateVaultMasterPassword(
     unlocked.records,
     {
       vaultId: currentVault.vaultId,
+      previousPayload: currentVault,
+      minimumSequence,
       categories: unlocked.categories,
       iterations: newIterations,
       createdAt: currentVault.createdAt,

@@ -153,18 +153,28 @@ export class VaultDurableObject {
     if (this.schemaInitialized) return;
     const sql = this.ctx.storage.sql;
 
-    sql.exec(`
+    const createVaultState = () => sql.exec(`
       CREATE TABLE IF NOT EXISTS vault_state (
         singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
         vault_id TEXT NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1),
-        format_version INTEGER NOT NULL CHECK (format_version = 2),
+        format_version INTEGER NOT NULL CHECK (format_version IN (2, 3)),
         ciphertext_json TEXT NOT NULL,
         content_sha256 TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
     `);
+    const previousSchema = sql.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vault_state'").toArray()[0];
+    if (previousSchema && /format_version\s*=\s*2/.test(String(previousSchema.sql))) {
+      this.ctx.storage.transactionSync(() => {
+        sql.exec('ALTER TABLE vault_state RENAME TO vault_state_legacy');
+        createVaultState();
+        sql.exec('INSERT INTO vault_state SELECT * FROM vault_state_legacy');
+        sql.exec('DROP TABLE vault_state_legacy');
+      });
+    }
+    createVaultState();
 
     sql.exec(`
       CREATE TABLE IF NOT EXISTS vault_snapshots (
@@ -421,8 +431,9 @@ export class VaultDurableObject {
       sql.exec(
         `INSERT INTO vault_state (
           singleton_id, vault_id, revision, format_version, ciphertext_json, content_sha256, created_at, updated_at
-        ) VALUES (1, ?, 1, 2, ?, ?, ?, ?)`,
+        ) VALUES (1, ?, 1, ?, ?, ?, ?, ?)`,
         initReq.vaultId,
+        initReq.vault.formatVersion,
         canonicalVaultJson,
         contentSha256,
         nowIso,
@@ -604,16 +615,36 @@ export class VaultDurableObject {
         };
       }
 
+      if (currentVault.formatVersion === 3 && (
+        putReq.vault.formatVersion !== 3 ||
+        (Number(putReq.vault.snapshotSequence) <= Number(currentVault.snapshotSequence) &&
+          canonicalVaultJson !== currentState.ciphertext_json)
+      )) {
+        return {
+          status: 409,
+          body: {
+            error: 'Conflict: Snapshot format or authenticated sequence would move backwards',
+            code: putReq.vault.formatVersion !== 3 ? 'FORMAT_DOWNGRADE' : 'SNAPSHOT_SEQUENCE_CONFLICT',
+            protocolVersion: SYNC_PROTOCOL_VERSION,
+            serverVaultId: currentState.vault_id,
+            serverRevision: currentState.revision,
+            serverVault: currentVault,
+          },
+        };
+      }
+
       const nextRevision = currentState.revision + 1;
 
       sql.exec(
         `UPDATE vault_state
          SET revision = ?,
+             format_version = ?,
              ciphertext_json = ?,
              content_sha256 = ?,
              updated_at = ?
          WHERE singleton_id = 1`,
         nextRevision,
+        putReq.vault.formatVersion,
         canonicalVaultJson,
         contentSha256,
         nowIso
