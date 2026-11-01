@@ -40,5 +40,10 @@
   },
   "engines": {
     "node": ">=22.13.0"
+  },
+  "overrides": {
+    "rimraf": {
+      "glob": "14.0.3"
+    }
   }
 }
